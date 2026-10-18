@@ -66,7 +66,15 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 #sidebody { flex: 1; overflow: auto; padding: 8px; background: var(--bg); }
 #viewwrap { flex: 1; display: flex; min-height: 0; }
 #hexcol { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-#view { flex: 1; overflow: hidden; font: 13px/18px var(--mono); white-space: pre; outline: none; cursor: default; user-select: none; }
+#view { flex: 1; overflow-x: auto; overflow-y: hidden; font: 13px/18px var(--mono); white-space: pre; outline: none; cursor: default; user-select: none; }
+#view canvas.v2d { display: block; cursor: crosshair; }
+#viewbar { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+#viewbar input[type=number] { padding: 2px 4px; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 4px 4px 0; }
+.seg button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 #vscroll { width: 14px; border-left: 1px solid var(--line); position: relative; background: var(--panel); cursor: pointer; }
 #vthumb { position: absolute; left: 2px; right: 2px; background: var(--muted); opacity: .45; border-radius: 4px; min-height: 18px; }
 #split { height: 5px; cursor: row-resize; background: var(--line); }
@@ -82,7 +90,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 .hx { height: 18px; }
 .hx .a, #hexhead .a { color: var(--muted); display: inline-block; width: 10ch; }
 #hexhead .a { cursor: pointer; }
-.hx span.y, #hexhead span.y { display: inline-block; width: 3ch; text-align: center; }
+.hx span.y, #hexhead span.y { display: inline-block; width: calc(var(--cw, 2ch) + 1ch); text-align: var(--ca, center); padding-right: .3ch; }
 .hx span.y.g8, #hexhead span.y.g8 { margin-right: 1ch; }
 .hx span.y.z { color: var(--zero); }
 .hx .t { margin-left: 2ch; color: var(--muted); }
@@ -168,7 +176,7 @@ table.keys td { padding: 3px 8px; border-bottom: 1px solid var(--line); vertical
   <button id="bOpenRef" title="Эталон: DAMOS (.dam) или A2L. Его карты подчёркнуты в hex, с ним идёт сверка">Эталон DAMOS / A2L…</button>
   <div class="menu" id="mPack"><button>Мой маппак ▾</button>
     <div class="items">
-      <button data-act="newObject">Новый объект у курсора… <span class="muted">M</span></button>
+      <button data-act="newObject">Новый объект у курсора… <span class="muted">K</span></button>
       <hr>
       <button data-act="saveA2l">Сохранить как A2L… <span class="muted">Ctrl+S</span></button>
       <button data-act="saveDamos">Сохранить как DAMOS (.dam)… <span class="muted">Ctrl+Shift+S</span></button>
@@ -194,6 +202,7 @@ table.keys td { padding: 3px 8px; border-bottom: 1px solid var(--line); vertical
   <div id="center">
     <div id="viewwrap">
       <div id="hexcol">
+        <div id="viewbar"></div>
         <div id="hexhead"></div>
         <div id="view" tabindex="0"></div>
       </div>

@@ -23,8 +23,9 @@
     hist: [], fwd: [],
     showOff: false,
     side: "pack", packFilter: "", refFilter: "", refKind: "all",
-    probe: { w: 16, rows: 16, cell: "u8", be: false, fmt: "dec" },
-    objFmt: "phys",
+    vw: { cols: 16, cell: "u8", be: false, fmt: "hex", mode: "text", org: 0 },
+    rot: { az: -0.7, el: 0.6 },
+    objFmt: "phys", objView: "table",
     checkOpts: { kinds: ["map", "curve"], lo: "", hi: "", reveal: false },
     lastCheck: null, lastSearch: null,
     undo: [], redo: [],
@@ -140,62 +141,240 @@
     return { p, text: (p.what === "nR" ? "счётчик строк" : "счётчик столбцов") + " = " + raw };
   }
 
-  // ------------------------------------------------------------------ hex
+  // ------------------------------------------------------------------ вид
+  //
+  // Основной вид -- как текстовый режим WinOLS: N столбцов ячеек выбранного
+  // формата (8/16/32 бит, LoHi/HiLo, hex/dec). Классический hex -- это 16
+  // столбцов по байту. Ширину меняют клавиши M (больше) и W (меньше): когда
+  // она равна ширине карты, карта встаёт ровной таблицей. В режиме 2D те же
+  // байты рисуются графиком, вертикальные линии -- через каждые N ячеек, и у
+  // карты они встают параллельно «скачкам».
+  //
+  // Строки можно выровнять по курсору (A): тогда строка начинается ровно с
+  // карты, а не с адреса, кратного ширине.
+  const cs = () => M.cellOf(S.vw.cell).size;
+  const rowBytes = () => S.vw.cols * cs();
+  const mod = (a, n) => ((a % n) + n) % n;
+  const org = () => mod(S.vw.org, rowBytes());
+  const rowBase = r => (org() ? org() - rowBytes() : 0) + r * rowBytes();
+  const rowOf = off => Math.floor((off - rowBase(0)) / rowBytes());
   function visibleRows() { return Math.max(4, Math.floor($("#view").clientHeight / LINE_H)); }
-  const totalRows = () => Math.ceil(size() / 16);
+  const totalRows = () => rowOf(Math.max(0, size() - 1)) + 1;
+  const cellStart = off => off - mod(off - S.vw.org, cs());
+  const MAX_COLS = 128;
 
-  function renderHead() {
-    let h = '<span class=a title="Щелчок — переключить адрес CPU / смещение в файле">' + (S.showOff ? "смещение" : "адрес") + "</span>";
-    for (let i = 0; i < 16; i++) h += '<span class="y' + (i === 7 ? " g8" : "") + '">' + hexl(i, 2) + "</span>";
-    $("#hexhead").innerHTML = h + "  <span>текст (cp1251)</span>";
+  const CELL_OPTS = [["u8", "8 бит"], ["s8", "8 бит со знаком"], ["u16", "16 бит"], ["s16", "16 бит со знаком"],
+    ["u32", "32 бит"], ["s32", "32 бит со знаком"], ["f32", "float"]];
+
+  function cellWidth() {
+    const c = M.cellOf(S.vw.cell);
+    if (c.float) return 11;
+    if (S.vw.fmt === "hex") return 2 * c.size;
+    return { 1: 4, 2: 6, 4: 11 }[c.size];
+  }
+  function fmtCell(v) {
+    if (!isFinite(v)) return "—";
+    const c = M.cellOf(S.vw.cell);
+    if (c.float) return M.fmtNum(v, 4);
+    if (S.vw.fmt === "hex") return hexl(v < 0 ? v + Math.pow(2, 8 * c.size) : v, 2 * c.size);
+    return String(v);
   }
 
+  function setVw(ch) {
+    Object.assign(S.vw, ch);
+    S.vw.cols = Math.max(1, Math.min(MAX_COLS, S.vw.cols | 0));
+    S.cur = cellStart(S.cur);
+    S.sel = null; S.anchor = S.cur;
+    S.top = Math.max(0, rowOf(S.cur) - 3);
+    renderBar(); renderHex(); renderInsp(); renderBottom();
+  }
+
+  function renderBar() {
+    const bar = $("#viewbar");
+    bar.innerHTML = "";
+    if (!S.fw) return;
+    const v = S.vw;
+    const seg = (val, text, title) => el("button", { class: v.mode === val ? "on" : "", title, onclick: () => setVw({ mode: val }) }, text);
+    const colsIn = el("input", { type: "number", min: 1, max: MAX_COLS, value: v.cols, style: { width: "62px" },
+      onchange: e => setVw({ cols: parseInt(e.target.value, 10) || 1 }) });
+    const c = M.cellOf(v.cell);
+    bar.append(
+      el("span", { class: "seg" }, seg("text", "Текст", "Значения таблицей (Tab — переключить)"), seg("2d", "2D", "Те же байты графиком (Tab — переключить)")),
+      el("span", { class: "muted" }, "столбцов"),
+      el("button", { title: "Меньше столбцов (W)", onclick: () => setVw({ cols: v.cols - 1 }) }, "W −"), colsIn,
+      el("button", { title: "Больше столбцов (M)", onclick: () => setVw({ cols: v.cols + 1 }) }, "M +"),
+      el("select", { title: "Формат ячейки", onchange: e => setVw({ cell: e.target.value }) },
+        ...CELL_OPTS.map(([k, t]) => el("option", { value: k, selected: v.cell === k }, t))),
+      el("select", { title: "Порядок байт: LoHi — Intel (C166, TriCore), HiLo — Motorola", disabled: c.size === 1, onchange: e => setVw({ be: e.target.value === "hilo" }) },
+        el("option", { value: "lohi", selected: !v.be }, "LoHi"), el("option", { value: "hilo", selected: v.be }, "HiLo")),
+      el("select", { title: "Запись чисел", disabled: c.float || v.mode === "2d", onchange: e => setVw({ fmt: e.target.value }) },
+        el("option", { value: "hex", selected: v.fmt === "hex" }, "hex"), el("option", { value: "dec", selected: v.fmt === "dec" }, "dec")),
+      el("button", { title: "Начинать строки с курсора (A) — карта встанет таблицей с первого столбца", onclick: alignRows }, "A ⇤ строки с курсора"));
+    if (org()) bar.append(el("span", { class: "muted mono" }, "с " + fa(S.vw.org)),
+      el("button", { title: "Строки — снова от начала файла", onclick: () => setVw({ org: 0 }) }, "×"));
+  }
+  function alignRows() { setVw({ org: S.cur }); }
+
   function renderHex() {
-    const view = $("#view");
     if (!S.fw) { renderWelcome(); return; }
-    renderHead();
-    const n = visibleRows();
     S.top = Math.max(0, Math.min(S.top, totalRows() - 1));
-    const selA = S.sel ? Math.min(S.sel.a, S.sel.b) : -1, selB = S.sel ? Math.max(S.sel.a, S.sel.b) : -2;
-    const d = data();
-    const out = [];
-    const aw = S.showOff ? Math.max(6, (size() - 1).toString(16).length) : addrW();
-    for (let r = S.top; r < Math.min(totalRows(), S.top + n); r++) {
-      const base = r * 16;
-      let h = "<span class=a>" + hexl(S.showOff ? base : S.base + base, aw) + "</span>";
-      let t = "";
-      for (let i = 0; i < 16; i++) {
-        const o = base + i;
-        if (o >= size()) { h += '<span class="y' + (i === 7 ? " g8" : "") + '">  </span>'; continue; }
-        let cls = "y" + (i === 7 ? " g8" : "") + (d[o] === 0 ? " z" : "");
-        const mu = mineAt(o);
-        if (mu) { const p = partAt(mu, o); cls += " k-" + (p ? PART_CLASS[p.what] : "obj"); }
-        const ru = refAt(o);
-        if (ru) { const p = partAt(ru, o); const c = p ? PART_CLASS[p.what] : "obj"; cls += " r-" + (c === "obj" ? "data" : c); }
-        if (o === S.cur) cls += " cur";
-        if (o >= selA && o <= selB) cls += " sel";
-        h += '<span class="' + cls + '" data-o="' + o + '">' + hexl(d[o], 2) + "</span>";
-        const b = d[o], pr = M.isPrintable(b);
-        t += '<span data-o="' + o + '" class="' + (o === S.cur ? "cur " : "") + (pr ? "on" : "") + (o >= selA && o <= selB ? " sel" : "") + '">' + (pr ? esc(M.CP1251[b]) : "·") + "</span>";
-      }
-      out.push("<div class=hx>" + h + "<span class=t>" + t + "</span></div>");
-    }
-    view.innerHTML = out.join("");
-    const tr = $("#vscroll"), th = $("#vthumb");
+    if (S.vw.mode === "2d") render2d(); else renderText();
+    const n = visibleRows(), tr = $("#vscroll"), th = $("#vthumb");
     const H = tr.clientHeight, part = Math.min(1, n / Math.max(1, totalRows()));
     const tH = Math.max(18, H * part);
     th.style.height = tH + "px";
     th.style.top = (totalRows() > n ? (S.top / (totalRows() - n)) * (H - tH) : 0) + "px";
   }
 
+  function selBounds() { return S.sel ? selRange() : [-1, -1]; }
+
+  function renderText() {
+    const view = $("#view");
+    const n = visibleRows(), c = cs(), cols = S.vw.cols, rb = rowBytes();
+    const [selA, selEnd] = selBounds();
+    const d = data();
+    const col = $("#hexcol");
+    col.style.setProperty("--cw", cellWidth() + "ch");
+    col.style.setProperty("--ca", S.vw.fmt === "hex" && !M.cellOf(S.vw.cell).float ? "center" : "right");
+    const showText = rb <= 64;
+    const group = cols > 8 && cols % 8 === 0;
+    const aw = S.showOff ? Math.max(6, (size() - 1).toString(16).length) : addrW();
+    let head = '<span class=a title="Щелчок — переключить адрес CPU / смещение в файле">' + (S.showOff ? "смещение" : "адрес") + "</span>";
+    for (let i = 0; i < cols; i++) head += '<span class="y' + (group && i % 8 === 7 ? " g8" : "") + '">' + hexl(i * c, 2) + "</span>";
+    $("#hexhead").innerHTML = head + (showText ? "  <span>текст (cp1251)</span>" : "");
+    const out = [];
+    const curCell = cellStart(S.cur);
+    for (let r = S.top; r < Math.min(totalRows(), S.top + n); r++) {
+      const base = rowBase(r);
+      let h = "<span class=a>" + hexl(S.showOff ? Math.max(0, base) : S.base + Math.max(0, base), aw) + "</span>";
+      for (let i = 0; i < cols; i++) {
+        const o = base + i * c;
+        const g = group && i % 8 === 7 ? " g8" : "";
+        if (o < 0 || o + c > size()) { h += '<span class="y' + g + '"></span>'; continue; }
+        const v = M.readCell(d, o, S.vw.cell, S.vw.be);
+        let cls = "y" + g + (v === 0 ? " z" : "");
+        const mu = mineAt(o);
+        if (mu) { const p = partAt(mu, o); cls += " k-" + (p ? PART_CLASS[p.what] : "obj"); }
+        const ru = refAt(o);
+        if (ru) { const p = partAt(ru, o); const k = p ? PART_CLASS[p.what] : "obj"; cls += " r-" + (k === "obj" ? "data" : k); }
+        if (o === curCell) cls += " cur";
+        if (o >= selA && o < selEnd) cls += " sel";
+        h += '<span class="' + cls + '" data-o="' + o + '">' + fmtCell(v) + "</span>";
+      }
+      let t = "";
+      if (showText) {
+        for (let i = 0; i < rb && base + i < size(); i++) {
+          const o = base + i;
+          if (o < 0) { t += " "; continue; }
+          const b = d[o], pr = M.isPrintable(b);
+          const cell = cellStart(o);
+          t += '<span data-o="' + cell + '" class="' + (cell === curCell ? "cur " : "") + (pr ? "on" : "") + (o >= selA && o < selEnd ? " sel" : "") + '">' + (pr ? esc(M.CP1251[b]) : "·") + "</span>";
+        }
+      }
+      out.push("<div class=hx>" + h + (showText ? "<span class=t>" + t + "</span>" : "") + "</div>");
+    }
+    view.innerHTML = out.join("");
+  }
+
+  // ---- 2D: значения графиком, линии через каждые N ячеек
+  function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  function fitCanvas(cv, w, h) {
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    cv.style.width = w + "px"; cv.style.height = h + "px";
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return g;
+  }
+
+  // start -- смещение первой ячейки, count -- сколько ячеек, grid -- ячеек в строке
+  function drawStrip(cv, w, h, start, count, grid, opt) {
+    const g = fitCanvas(cv, w, h);
+    const c = cs(), d = data();
+    const vals = [];
+    for (let i = 0; i < count; i++) vals.push(M.readCell(d, start + i * c, S.vw.cell, S.vw.be));
+    const fin = vals.filter(isFinite);
+    const lo = fin.length ? Math.min(...fin) : 0, hi = fin.length ? Math.max(...fin) : 1;
+    const L = 52, R = 8, T = 16, B = 18;
+    const step = count > 1 ? (w - L - R) / (count - 1) : 0;
+    const xOf = i => L + i * step;
+    const yOf = v => T + (h - T - B) * (hi > lo ? 1 - (v - lo) / (hi - lo) : 0.5);
+    g.fillStyle = cssVar("--bg"); g.fillRect(0, 0, w, h);
+    // полосы: ваш маппак, выделение, эталон
+    const band = (test, color, y0, y1) => {
+      let i = 0;
+      while (i < count) {
+        if (!test(start + i * c)) { i++; continue; }
+        let j = i;
+        while (j + 1 < count && test(start + (j + 1) * c)) j++;
+        g.fillStyle = color;
+        g.fillRect(xOf(i) - step / 2, y0, Math.max(1, (j - i + 1) * step), y1 - y0);
+        i = j + 1;
+      }
+    };
+    band(o => !!mineAt(o), cssVar("--hex-obj"), T, h - B);
+    if (opt.sel && S.sel) { const [a, b] = selRange(); band(o => o >= a && o < b, cssVar("--sel-bg"), T, h - B); }
+    if (refVisible()) band(o => !!refAt(o), cssVar("--ref"), h - B, h - B + 4);
+    // линии строк
+    g.strokeStyle = cssVar("--line"); g.lineWidth = 1;
+    g.fillStyle = cssVar("--muted"); g.font = "10px " + cssVar("--mono");
+    const rowPx = grid * step;
+    const labelEvery = Math.max(1, Math.ceil(70 / Math.max(1, rowPx)));
+    // линии -- по границам строк основного вида (с учётом выравнивания)
+    const i0 = mod((rowBase(0) - start) / c, grid);
+    for (let k = 0, i = i0; i <= count; i += grid, k++) {
+      const x = Math.round(xOf(i) - step / 2) + 0.5;
+      g.beginPath(); g.moveTo(x, T); g.lineTo(x, h - B); g.stroke();
+      if (opt.labels && k % labelEvery === 0 && i < count) g.fillText(hexl(S.base + start + i * c), x + 2, T - 4);
+    }
+    // значения
+    g.strokeStyle = cssVar("--fg"); g.lineWidth = 1.2;
+    g.beginPath();
+    vals.forEach((v, i) => { const x = xOf(i), y = yOf(v); if (i) g.lineTo(x, y); else g.moveTo(x, y); });
+    g.stroke();
+    // курсор
+    if (opt.cursor) {
+      const i = (cellStart(S.cur) - start) / c;
+      if (i >= 0 && i < count) {
+        g.strokeStyle = cssVar("--accent"); g.lineWidth = 2;
+        g.beginPath(); g.moveTo(xOf(i), T); g.lineTo(xOf(i), h - B); g.stroke();
+      }
+    }
+    g.fillStyle = cssVar("--muted"); g.font = "11px " + cssVar("--ui");
+    g.fillText(M.fmtNum(hi, 3), 4, T + 10); g.fillText(M.fmtNum(lo, 3), 4, h - B - 2);
+    cv._map = { start, count, L, step };
+  }
+
+  function render2d() {
+    const view = $("#view");
+    const c = cs();
+    const start = Math.max(0, rowBase(S.top));
+    const count = Math.max(1, Math.min(visibleRows() * S.vw.cols, Math.floor((size() - start) / c)));
+    $("#hexhead").innerHTML = '<span class=muted> 2D: ' + count + " ячеек с " + fa(start) + ", линии — через " + S.vw.cols + " (M/W)</span>";
+    let cv = view.querySelector("canvas.v2d");
+    if (!cv) { view.innerHTML = ""; cv = el("canvas", { class: "v2d" }); view.append(cv); }
+    drawStrip(cv, view.clientWidth, view.clientHeight, start, count, S.vw.cols, { cursor: true, sel: true, labels: true });
+  }
+
+  // смещение ячейки под точкой графика
+  function offAtCanvas(cv, x) {
+    const m = cv._map;
+    if (!m) return null;
+    const i = Math.max(0, Math.min(m.count - 1, Math.round(m.step ? (x - m.L) / m.step : 0)));
+    return m.start + i * cs();
+  }
+
   function renderWelcome() {
     $("#hexhead").innerHTML = "";
+    $("#viewbar").innerHTML = "";
     $("#view").innerHTML = '<div id=welcome>' +
       "<h2>Hex-редактор для разметки прошивок ЭБУ</h2><ol>" +
       "<li><b>Прошивка…</b> — откройте .bin (или перетащите файл в окно).</li>" +
       "<li><b>база</b> — адрес первого байта файла, как <i>Base Address</i> при загрузке в Ghidra и как адреса в DAMOS/A2L. При загрузке эталона база подбирается сама.</li>" +
       "<li><b>Эталон DAMOS / A2L…</b> — его карты подчёркнуты в hex и перечислены на вкладке «Эталон». Для тренировки эталон можно скрыть.</li>" +
-      "<li>Размечайте свой маппак: встаньте курсором на начало карты (или выделите её байты) и нажмите <kbd>M</kbd> — карта, кривая, ось, значение. Таблица в физических единицах видна сразу.</li>" +
+      "<li>Ищите карты как в WinOLS: клавишами <kbd>M</kbd> и <kbd>W</kbd> меняйте число столбцов, пока карта не встанет ровной таблицей (в режиме 2D, <kbd>Tab</kbd>, — пока линии не станут параллельны скачкам). Формат ячеек — 8/16/32 бит, LoHi/HiLo — над таблицей.</li>" +
+      "<li>Выделите карту и нажмите <kbd>K</kbd> — размер и формат подставятся сами. Внизу — таблица, 2D и 3D в физических единицах.</li>" +
       "<li><b>Мой маппак → Сохранить как A2L / DAMOS</b>. <b>Сверка</b> — что совпало с эталоном, что нет и почему.</li>" +
       "</ol><p class=muted>Только чтение: байты прошивки не меняются. Файлы никуда не отправляются, маппак автоматически сохраняется в браузере. Клавиши — <kbd>F1</kbd>.</p></div>";
   }
@@ -259,28 +438,6 @@
     return h + "</table>";
   }
 
-  function plot(values, w, h) {
-    const cv = el("canvas", { class: "plot", width: w, height: h });
-    const g = cv.getContext("2d");
-    const fin = values.filter(isFinite);
-    if (!fin.length) return cv;
-    const lo = Math.min(...fin), hi = Math.max(...fin);
-    const css = getComputedStyle(document.documentElement);
-    g.strokeStyle = css.getPropertyValue("--line"); g.lineWidth = 1;
-    g.strokeRect(0.5, 0.5, w - 1, h - 1);
-    g.strokeStyle = css.getPropertyValue("--obj"); g.lineWidth = 1.5;
-    g.beginPath();
-    values.forEach((v, i) => {
-      const x = 4 + (w - 8) * (values.length > 1 ? i / (values.length - 1) : 0.5);
-      const y = h - 4 - (h - 8) * (hi > lo ? (v - lo) / (hi - lo) : 0.5);
-      if (i) g.lineTo(x, y); else g.moveTo(x, y);
-    });
-    g.stroke();
-    g.fillStyle = css.getPropertyValue("--muted"); g.font = "11px sans-serif";
-    g.fillText(fmtVal(hi), 6, 13); g.fillText(fmtVal(lo), 6, h - 6);
-    return cv;
-  }
-
   function myAxisAt(off) { return S.pack.objects.find(o => o.addr === off && o.kind === "axis") || null; }
   function refAxisAt(off) { return S.ref.pack.objects.find(o => o.addr === off && o.kind === "axis") || null; }
 
@@ -292,7 +449,7 @@
     if (mu) return objPanel(mu.item, false, bar, body);
     const ru = refAt(S.cur);
     if (ru) return objPanel(ru.item, true, bar, body);
-    probePanel(bar, body);
+    stripPanel(bar, body);
   }
 
   function objPanel(o, isRef, bar, body) {
@@ -302,11 +459,16 @@
     bar.append(el("span", { class: "badge", style: { color: isRef ? "var(--ref)" : "var(--obj)" } }, isRef ? "эталон" : "мой маппак"),
       el("b", { class: "mono" }, o.name || "(без имени)"), el("span", { class: "muted" }, M.describe(o)), fmtSel);
     if (isRef) bar.append(el("button", { onclick: () => adoptRef([refOrig(o)]) }, "Взять в маппак"));
-    else bar.append(el("button", { onclick: () => mapDialog(o) }, "Изменить (M)"),
+    else bar.append(el("button", { onclick: () => mapDialog(o) }, "Изменить (K)"),
       el("button", { onclick: () => change(() => S.pack.remove(o)) }, "Удалить (Del)"));
-    const cs = M.cellOf(o.cell).size;
-    const fmt = S.objFmt === "phys" ? fmtVal : S.objFmt === "raw" ? (v => String(v)) : (v => hexl(v < 0 ? v + Math.pow(2, 8 * cs) : v, 2 * cs));
+    const csz = M.cellOf(o.cell).size;
+    const fmt = S.objFmt === "phys" ? fmtVal : S.objFmt === "raw" ? (v => String(v)) : (v => hexl(v < 0 ? v + Math.pow(2, 8 * csz) : v, 2 * csz));
     const vals = S.objFmt === "phys" ? r.values : (r.raw || []);
+    const rows = (o.kind === "map" || o.kind === "block") ? o.rows : 1;
+    const views = (o.kind === "value" || o.kind === "string") ? [] : rows > 1 ? [["table", "Таблица"], ["2d", "2D"], ["3d", "3D"]] : [["table", "Таблица"], ["2d", "2D"]];
+    let view = views.some(v => v[0] === S.objView) ? S.objView : "table";
+    if (views.length) bar.prepend(el("span", { class: "seg" }, ...views.map(([k, t]) =>
+      el("button", { class: view === k ? "on" : "", onclick: () => { S.objView = k; renderBottom(); } }, t))));
     if (o.desc) body.append(el("div", { class: "hint" }, o.desc));
     if (o.layout === "bosch") {
       const bad = [];
@@ -316,38 +478,100 @@
     }
     if (o.kind === "string") { body.append(el("div", { class: "mono" }, '"' + (r.text || "") + '"')); return; }
     if (o.kind === "value") { body.append(el("div", { class: "score mono" }, fmt(vals[0]) + (S.objFmt === "phys" && o.unit ? " " + o.unit : ""))); return; }
-    const rows = (o.kind === "map" || o.kind === "block") ? o.rows : 1;
-    const wrap = el("div", { style: { display: "flex", gap: "16px", alignItems: "flex-start", flexWrap: "wrap" } });
-    wrap.append(el("div", { html: tableHtml(vals, o.cols, rows, r.axisC, o.kind === "map" ? r.axisR : null, fmt) }));
-    if (rows === 1 && o.cols > 2) wrap.append(plot(vals, Math.min(700, Math.max(300, o.cols * 18)), 140));
-    body.append(wrap);
+    const w = Math.max(320, Math.min(1000, body.clientWidth - 24)), h = Math.max(160, body.clientHeight - 40);
+    if (view === "3d") body.append(surface3d(vals, o.cols, rows, r.axisC, r.axisR, w, h));
+    else if (view === "2d") body.append(plotRows(vals, o.cols, rows, r.axisC, w, h));
+    else body.append(el("div", { html: tableHtml(vals, o.cols, rows, r.axisC, o.kind === "map" ? r.axisR : null, fmt) }));
   }
 
-  function probePanel(bar, body) {
-    const p = S.probe;
-    const num = (key, min, max) => el("input", { type: "number", value: p[key], min, max, style: { width: "64px" },
-      onchange: e => { p[key] = Math.max(min, Math.min(max, parseInt(e.target.value, 10) || min)); renderBottom(); } });
-    bar.append(el("b", {}, "Сетка у курсора"),
-      el("button", { title: "Уже ( - )", onclick: () => { p.w = Math.max(1, p.w - 1); renderBottom(); } }, "−"),
-      el("span", {}, "ширина"), num("w", 1, 64),
-      el("button", { title: "Шире ( + )", onclick: () => { p.w = Math.min(64, p.w + 1); renderBottom(); } }, "+"),
-      el("span", {}, "строк"), num("rows", 1, 64),
-      el("select", { onchange: e => { p.cell = e.target.value; renderBottom(); } },
-        ...Object.keys(M.CELLS).map(c => el("option", { value: c, selected: p.cell === c }, c))),
-      el("label", {}, el("input", { type: "checkbox", checked: p.be, onchange: e => { p.be = e.target.checked; renderBottom(); } }), " BE"),
-      el("select", { onchange: e => { p.fmt = e.target.value; renderBottom(); } },
-        el("option", { value: "dec", selected: p.fmt === "dec" }, "dec"), el("option", { value: "hex", selected: p.fmt === "hex" }, "hex")),
-      el("button", { onclick: () => mapDialog(null, { kind: p.rows > 1 ? "map" : "curve", cols: p.w, rows: p.rows, cell: p.cell, be: p.be }) }, "Разметить так… (M)"));
-    const cs = M.cellOf(p.cell).size;
-    const vals = [];
-    for (let i = 0; i < p.w * p.rows; i++) vals.push(M.readCell(data(), S.cur + i * cs, p.cell, p.be));
-    const fmt = p.fmt === "hex" ? (v => isFinite(v) ? hexl(v < 0 ? v + Math.pow(2, 8 * cs) : v, 2 * cs) : "—") : (v => isFinite(v) ? String(v) : "—");
-    const wrap = el("div", { style: { display: "flex", gap: "16px", alignItems: "flex-start", flexWrap: "wrap" } });
-    wrap.append(el("div", { html: tableHtml(vals, p.w, p.rows, null, null, fmt) }));
-    const prof = [];
-    for (let i = 0; i < 512; i++) { const v = M.readCell(data(), S.cur + i * cs, p.cell, p.be); if (!isFinite(v)) break; prof.push(v); }
-    wrap.append(el("div", {}, el("div", { class: "hint" }, "Профиль 512 ячеек от курсора — у карты видны «зубья» с периодом в ширину строки"), plot(prof, 520, 150)));
-    body.append(wrap);
+  function stripPanel(bar, body) {
+    bar.append(el("b", {}, "2D от курсора"),
+      el("span", { class: "hint" }, "линии через " + S.vw.cols + " ячеек (M/W), формат — как в основном виде"),
+      el("button", { onclick: () => mapDialog(null) }, "Новый объект… (K)"));
+    const w = Math.max(300, body.clientWidth - 20);
+    const cv = el("canvas", { class: "plot" });
+    body.append(cv);
+    const count = Math.max(2, Math.min(S.vw.cols * 24, 2048, Math.floor((size() - cellStart(S.cur)) / cs())));
+    drawStrip(cv, w, Math.max(120, body.clientHeight - 16), cellStart(S.cur), count, S.vw.cols, { labels: true });
+  }
+
+  // Строки карты линиями: каждая строка -- своя кривая
+  function plotRows(values, cols, rows, axC, w, h) {
+    const cv = el("canvas", { class: "plot" });
+    const g = fitCanvas(cv, w, h);
+    const fin = values.filter(isFinite);
+    const lo = fin.length ? Math.min(...fin) : 0, hi = fin.length ? Math.max(...fin) : 1;
+    const L = 52, R = 10, T = 10, B = 20;
+    const xOf = i => L + (cols > 1 ? i * (w - L - R) / (cols - 1) : (w - L - R) / 2);
+    const yOf = v => T + (h - T - B) * (hi > lo ? 1 - (v - lo) / (hi - lo) : 0.5);
+    g.strokeStyle = cssVar("--line"); g.strokeRect(L - 0.5, T - 0.5, w - L - R + 1, h - T - B + 1);
+    for (let r = 0; r < rows; r++) {
+      g.strokeStyle = "hsl(" + Math.round(220 - 220 * (rows > 1 ? r / (rows - 1) : 0)) + ",70%,50%)";
+      g.lineWidth = 1.5;
+      g.beginPath();
+      for (let c = 0; c < cols; c++) { const v = values[r * cols + c], x = xOf(c), y = yOf(v); if (c) g.lineTo(x, y); else g.moveTo(x, y); }
+      g.stroke();
+    }
+    g.fillStyle = cssVar("--muted"); g.font = "11px " + cssVar("--ui");
+    g.fillText(M.fmtNum(hi, 3), 4, T + 10); g.fillText(M.fmtNum(lo, 3), 4, h - B);
+    if (axC) { g.fillText(M.fmtNum(axC[0], 3), L, h - 5); const t = M.fmtNum(axC[cols - 1], 3); g.fillText(t, w - R - g.measureText(t).width, h - 5); }
+    return cv;
+  }
+
+  // 3D-поверхность карты: перетаскивание мышью вращает, двойной щелчок -- сброс
+  let drag3d = null;
+  window.addEventListener("mousemove", e => {
+    if (!drag3d) return;
+    S.rot.az = drag3d.az + (e.clientX - drag3d.x) * 0.01;
+    S.rot.el = Math.max(0.05, Math.min(1.55, drag3d.el + (e.clientY - drag3d.y) * 0.01));
+    if (drag3d.cv.isConnected) drag3d.draw();
+  });
+  window.addEventListener("mouseup", () => { if (drag3d) { drag3d.cv.style.cursor = "grab"; drag3d = null; } });
+
+  function surface3d(values, cols, rows, axC, axR, w, h) {
+    const cv = el("canvas", { class: "plot", style: { cursor: "grab" } });
+    const draw = () => {
+      const g = fitCanvas(cv, w, h);
+      g.fillStyle = cssVar("--bg"); g.fillRect(0, 0, w, h);
+      const fin = values.filter(isFinite);
+      const lo = fin.length ? Math.min(...fin) : 0, hi = fin.length ? Math.max(...fin) : 1;
+      const { az, el: elv } = S.rot;
+      const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(elv), se = Math.sin(elv);
+      const scale = Math.min(w * 0.38, h * 0.5), cx = w / 2, cy = h / 2 + 8;
+      const P = (c, r) => {
+        const X = cols > 1 ? (c / (cols - 1) - 0.5) * 2 : 0;
+        const Y = rows > 1 ? (r / (rows - 1) - 0.5) * 2 : 0;
+        const v = values[r * cols + c];
+        const Z = ((hi > lo ? (v - lo) / (hi - lo) : 0.5) - 0.5) * 1.3;
+        const x1 = X * ca - Y * sa, y1 = X * sa + Y * ca;
+        const up = Z * ce + y1 * se, depth = y1 * ce - Z * se;
+        return { x: cx + x1 * scale, y: cy - up * scale, d: depth, t: hi > lo ? (v - lo) / (hi - lo) : 0.5 };
+      };
+      const pts = [];
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) pts.push(P(c, r));
+      const at = (c, r) => pts[r * cols + c];
+      const quads = [];
+      for (let r = 0; r + 1 < rows; r++) for (let c = 0; c + 1 < cols; c++) {
+        const q = [at(c, r), at(c + 1, r), at(c + 1, r + 1), at(c, r + 1)];
+        quads.push({ q, d: (q[0].d + q[1].d + q[2].d + q[3].d) / 4, t: (q[0].t + q[1].t + q[2].t + q[3].t) / 4 });
+      }
+      quads.sort((a, b) => b.d - a.d);
+      g.lineWidth = 0.6;
+      for (const { q, t } of quads) {
+        g.beginPath(); g.moveTo(q[0].x, q[0].y); for (let k = 1; k < 4; k++) g.lineTo(q[k].x, q[k].y); g.closePath();
+        g.fillStyle = "hsl(" + Math.round(220 - 220 * t) + ",70%,58%)"; g.fill();
+        g.strokeStyle = "rgba(0,0,0,.35)"; g.stroke();
+      }
+      g.fillStyle = cssVar("--muted"); g.font = "11px " + cssVar("--ui");
+      const lab = (p, s) => g.fillText(s, p.x + 4, p.y + 12);
+      if (axC) { lab(at(0, 0), "" + M.fmtNum(axC[0], 3)); lab(at(cols - 1, 0), "" + M.fmtNum(axC[cols - 1], 3)); }
+      if (axR && rows > 1) lab(at(0, rows - 1), "" + M.fmtNum(axR[rows - 1], 3));
+      g.fillText("макс " + M.fmtNum(hi, 3) + "   мин " + M.fmtNum(lo, 3) + "   (тяните мышью, двойной щелчок — сброс)", 8, 14);
+    };
+    cv.addEventListener("mousedown", e => { drag3d = { x: e.clientX, y: e.clientY, az: S.rot.az, el: S.rot.el, draw, cv }; cv.style.cursor = "grabbing"; e.preventDefault(); });
+    cv.addEventListener("dblclick", () => { S.rot = { az: -0.7, el: 0.6 }; draw(); });
+    draw();
+    return cv;
   }
 
   // ----------------------------------------------------------- боковая панель
@@ -381,9 +605,9 @@
     b.append(el("div", { class: "row" },
       el("input", { placeholder: "фильтр по имени или адресу", value: S.packFilter, style: { flex: "1" }, "data-keep": "pf",
         oninput: e => { S.packFilter = e.target.value; renderSide(); } }),
-      el("button", { title: "Новый объект у курсора", onclick: () => mapDialog(null) }, "+ M")));
+      el("button", { title: "Новый объект у курсора (K)", onclick: () => mapDialog(null) }, "+ K")));
     b.append(el("div", { class: "hint" }, objs.length + " объектов" + (shown.length !== objs.length ? ", показано " + shown.length : "")));
-    if (!objs.length) b.append(el("div", { class: "empty" }, "Маппак пуст. Встаньте на начало карты (или выделите её байты) и нажмите M. Сохраняется в A2L или DAMOS через меню «Мой маппак»."));
+    if (!objs.length) b.append(el("div", { class: "empty" }, "Маппак пуст. Подберите ширину клавишами M/W, чтобы карта встала ровной таблицей, выделите её и нажмите K. Сохраняется в A2L или DAMOS через меню «Мой маппак»."));
     objList(b, shown, o => o.addr, mineAt(S.cur));
   }
 
@@ -476,13 +700,13 @@
 
   // ----------------------------------------------------------------- навигация
   function ensureVisible() {
-    const n = visibleRows(), r = S.cur >> 4;
+    const n = visibleRows(), r = rowOf(S.cur);
     if (r < S.top) S.top = r;
     else if (r >= S.top + n) S.top = r - n + 1;
   }
   function setCur(off, extend) {
     if (!S.fw) return;
-    off = Math.max(0, Math.min(size() - 1, off));
+    off = cellStart(Math.max(0, Math.min(size() - 1, off)));
     if (extend) {
       if (S.anchor === null) S.anchor = S.cur;
       S.sel = { a: S.anchor, b: off };
@@ -500,7 +724,7 @@
     if (!S.fw || !inImg(off)) { toast("Адрес вне образа — проверьте базу"); return; }
     if (!noHist) { S.hist.push(S.cur); if (S.hist.length > 200) S.hist.shift(); S.fwd = []; }
     S.cur = off; S.sel = null; S.anchor = off;
-    S.top = Math.max(0, (off >> 4) - 3);
+    S.top = Math.max(0, rowOf(off) - 3);
     renderAll();
     $("#view").focus();
   }
@@ -508,7 +732,7 @@
   function forward() { if (S.fwd.length) { S.hist.push(S.cur); goTo(S.fwd.pop(), true); } }
 
   function selRange() {
-    if (S.sel) return [Math.min(S.sel.a, S.sel.b), Math.max(S.sel.a, S.sel.b) + 1];
+    if (S.sel) return [Math.min(S.sel.a, S.sel.b), Math.min(size(), Math.max(S.sel.a, S.sel.b) + cs())];
     return [S.cur, S.cur + 1];
   }
 
@@ -570,13 +794,15 @@
     const o = M.normalize(existing ? JSON.parse(JSON.stringify(existing)) : Object.assign({
       kind: "map", addr: S.cur, cols: 16, rows: 16, cell: "u8", name: "",
     }, preset || {}));
-    if (!existing && S.sel) {
-      const [a, b] = selRange();
-      o.addr = a;
-      if (!preset) {
-        const n = b - a;
-        if (n <= 64) { o.kind = "curve"; o.cols = n; o.rows = 1; }
-        else o.rows = Math.max(1, Math.floor(n / o.cols));
+    // как в WinOLS: ширина и формат ячейки -- те, при которых карта встала ровно
+    if (!existing && !preset) {
+      o.cell = S.vw.cell; o.be = S.vw.be; o.cols = S.vw.cols;
+      if (S.sel) {
+        const [a, b] = selRange();
+        const n = Math.max(1, Math.floor((b - a) / cs()));
+        o.addr = a;
+        if (n <= S.vw.cols) { o.kind = "curve"; o.cols = n; o.rows = 1; }
+        else { o.kind = "map"; o.rows = Math.ceil(n / S.vw.cols); }
       }
     }
     const f = {};
@@ -709,7 +935,7 @@
       S.cur = n.addr; S.sel = null; S.anchor = n.addr;
       change(() => { if (existing) S.pack.remove(existing); S.pack.add(n); });
     } });
-    dialog((existing ? "Изменить: " : "Новый объект: ") + "карта / кривая / ось — M", body, btns);
+    dialog((existing ? "Изменить: " : "Новый объект: ") + "карта / кривая / ось — K", body, btns);
     refresh();
     f.name.focus();
   }
@@ -846,7 +1072,7 @@
       if (i + pat.length > d.length) continue;
       let ok = true;
       for (let k = 0; k < pat.length; k++) if (pat[k] >= 0 && d[i + k] !== pat[k]) { ok = false; break; }
-      if (ok) { goTo(i); S.sel = { a: i, b: i + pat.length - 1 }; renderHex(); renderInsp(); return; }
+      if (ok) { goTo(i); S.sel = { a: i, b: cellStart(i + pat.length - 1) }; renderHex(); renderInsp(); return; }
     }
     toast("Не найдено");
   }
@@ -858,10 +1084,12 @@
       ["G, Ctrl+G", "перейти к адресу, +смещению или имени"],
       ["] / [", "следующий / предыдущий объект (ваш или эталона)"],
       ["Alt+← / Alt+→", "назад / вперёд по переходам"],
-      ["M", "новый объект у курсора или по выделению; на своём объекте — изменить"],
+      ["M / W", "больше / меньше столбцов (как в WinOLS)"],
+      ["A", "начинать строки с курсора — карта встанет таблицей с первого столбца"],
+      ["Tab", "переключить вид: текст ↔ 2D"],
+      ["K", "новый объект у курсора или по выделению; на своём объекте — изменить"],
       ["Enter, двойной щелчок", "открыть объект под курсором"],
       ["Del", "удалить свой объект под курсором"],
-      ["- / +", "сетка у курсора: уже / шире"],
       ["Ctrl+F, F3", "поиск байтов или текста; следующее"],
       ["Ctrl+Z / Ctrl+Y", "отменить / вернуть"],
       ["Ctrl+S / Ctrl+Shift+S", "сохранить маппак как A2L / DAMOS"],
@@ -869,7 +1097,7 @@
     ];
     const t = el("table", { class: "keys" }, ...keys.map(([k, d]) => el("tr", {}, el("td", {}, el("kbd", {}, k)), el("td", {}, d))));
     dialog("Горячие клавиши", el("div", {}, t,
-      el("p", { class: "hint" }, "Цвета в hex: заливка — ваш маппак (данные, оси, счётчики), подчёркивание — эталон. Адрес — база + смещение; щелчок по заголовку столбца адресов переключает на смещение в файле.")), []);
+      el("p", { class: "hint" }, "Цвета: заливка — ваш маппак (данные, оси, счётчики), подчёркивание — эталон. Адрес — база + смещение; щелчок по заголовку столбца адресов переключает на смещение в файле. В 3D-виде карту вращают мышью.")), []);
   }
 
   // ------------------------------------------------------------ файлы
@@ -1026,7 +1254,7 @@
 
   function renderAll() {
     $("#baseIn").value = "0x" + hexl(S.base);
-    renderHex(); renderInsp(); renderStatus(); renderBottom(); renderSide();
+    renderBar(); renderHex(); renderInsp(); renderStatus(); renderBottom(); renderSide();
   }
   function syncTabs() { for (const x of $("#sidetabs").children) x.classList.toggle("on", x.dataset.tab === S.side); }
 
@@ -1052,23 +1280,26 @@
     else if (ctrl && k === "Home") setCur(0, e.shiftKey);
     else if (ctrl && k === "End") setCur(size() - 1, e.shiftKey);
     else if (ctrl || e.altKey) handled = false;
-    else if (k === "ArrowRight") setCur(S.cur + 1, e.shiftKey);
-    else if (k === "ArrowLeft") setCur(S.cur - 1, e.shiftKey);
-    else if (k === "ArrowDown") setCur(S.cur + 16, e.shiftKey);
-    else if (k === "ArrowUp") setCur(S.cur - 16, e.shiftKey);
-    else if (k === "PageDown") { S.top += n - 1; setCur(S.cur + 16 * (n - 1), e.shiftKey); }
-    else if (k === "PageUp") { S.top = Math.max(0, S.top - n + 1); setCur(S.cur - 16 * (n - 1), e.shiftKey); }
-    else if (k === "Home") setCur(S.cur & ~15, e.shiftKey);
-    else if (k === "End") setCur(S.cur | 15, e.shiftKey);
+    else if (k === "ArrowRight") setCur(cellStart(S.cur) + cs(), e.shiftKey);
+    else if (k === "ArrowLeft") setCur(cellStart(S.cur) - cs(), e.shiftKey);
+    else if (k === "ArrowDown") setCur(S.cur + rowBytes(), e.shiftKey);
+    else if (k === "ArrowUp") setCur(S.cur - rowBytes(), e.shiftKey);
+    else if (k === "PageDown") { S.top += n - 1; setCur(S.cur + rowBytes() * (n - 1), e.shiftKey); }
+    else if (k === "PageUp") { S.top = Math.max(0, S.top - n + 1); setCur(S.cur - rowBytes() * (n - 1), e.shiftKey); }
+    else if (k === "Home") setCur(Math.max(0, rowBase(rowOf(S.cur))), e.shiftKey);
+    else if (k === "End") setCur(rowBase(rowOf(S.cur)) + rowBytes() - cs(), e.shiftKey);
+    else if (kl === "a") alignRows();
+    else if (k === "Tab") setVw({ mode: S.vw.mode === "2d" ? "text" : "2d" });
     else if (k === "Escape") { S.sel = null; renderHex(); renderInsp(); renderStatus(); }
     else if (k === "F3") searchNext();
     else if (k === "Enter") openUnderCursor();
     else if (k === "Delete") { const u = mineAt(S.cur); if (u) change(() => S.pack.remove(u.item)); }
     else if (kl === "g") gotoDialog();
-    else if (kl === "m") { const u = mineAt(S.cur); mapDialog(u && !S.sel ? u.item : null); }
+    else if (kl === "k") { const u = mineAt(S.cur); mapDialog(u && !S.sel ? u.item : null); }
+    else if (kl === "m" || k === "+" || k === "=") setVw({ cols: S.vw.cols + 1 });
+    else if (kl === "w" || k === "-") setVw({ cols: S.vw.cols - 1 });
     else if (k === "]") jumpObject(1);
     else if (k === "[") jumpObject(-1);
-    else if (k === "-" || k === "+" || k === "=") { S.probe.w = Math.max(1, Math.min(64, S.probe.w + (k === "-" ? -1 : 1))); renderBottom(); }
     else if (k === "?") helpDialog();
     else handled = false;
     if (handled) e.preventDefault();
@@ -1083,33 +1314,39 @@
   }
 
   // ------------------------------------------------------------ мышь
+  // смещение ячейки под мышью: в тексте -- по ячейке, в 2D -- по точке графика
+  function offAtEvent(e) {
+    const cv = e.target.closest && e.target.closest("canvas.v2d");
+    if (cv) return offAtCanvas(cv, e.clientX - cv.getBoundingClientRect().left);
+    const t = e.target.closest && e.target.closest("[data-o]");
+    return t ? +t.dataset.o : null;
+  }
+
   function wireView() {
     const view = $("#view");
     let dragging = false;
     view.addEventListener("mousedown", e => {
       if (!S.fw) return;
       view.focus();
-      const t = e.target.closest("[data-o]");
-      if (!t) return;
+      const off = offAtEvent(e);
+      if (off === null) return;
       e.preventDefault();
-      const off = +t.dataset.o;
       if (e.shiftKey) { setCur(off, true); return; }
       setCur(off, false);
       dragging = true;
     });
     view.addEventListener("mousemove", e => {
       if (!dragging || !(e.buttons & 1)) return;
-      const t = e.target.closest("[data-o]");
-      if (!t) return;
-      const off = +t.dataset.o;
-      if (off !== S.cur) setCur(off, true);
+      const off = offAtEvent(e);
+      if (off !== null && off !== S.cur) setCur(off, true);
     });
     window.addEventListener("mouseup", () => { dragging = false; });
-    view.addEventListener("dblclick", e => { if (e.target.closest("[data-o]")) openUnderCursor(); });
+    view.addEventListener("dblclick", e => { if (offAtEvent(e) !== null) openUnderCursor(); });
     view.addEventListener("wheel", e => {
       if (!S.fw) return;
       e.preventDefault();
-      S.top = Math.max(0, Math.min(totalRows() - 1, S.top + Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40)) * 3));
+      const rowsStep = S.vw.mode === "2d" ? Math.max(1, Math.round(visibleRows() / 8)) : 3;
+      S.top = Math.max(0, Math.min(totalRows() - 1, S.top + Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40)) * rowsStep));
       renderHex();
     }, { passive: false });
     $("#hexhead").addEventListener("click", e => { if (e.target.closest(".a")) { S.showOff = !S.showOff; renderHex(); } });
