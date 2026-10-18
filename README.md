@@ -11,8 +11,10 @@ Ghidra остаётся отдельно: адреса здесь те же, ч�
 
 ## Запуск
 
-Откройте `trainer/index.html` в Chrome, Edge или Firefox. Установка и
-сервер не нужны, файлы никуда не отправляются.
+Откройте `dist/ecu-hex-trainer.html` (всё в одном файле) или
+`trainer/index.html` в Chrome, Edge или Firefox. Установка и сервер не нужны,
+файлы никуда не отправляются. Однофайловая сборка обновляется командой
+`python3 tools/build_single.py`.
 
 ## Как работать
 
@@ -106,6 +108,7 @@ A2L называется X и Y:
 | `trainer/markup.js` | маппак (адреса — смещения в файле) |
 | `trainer/compare.js` | сверка маппака с эталоном |
 | `tests/run.js` | тесты |
+| `tools/build_single.py` | сборка в один файл `dist/ecu-hex-trainer.html` |
 
 ## Тесты
 
