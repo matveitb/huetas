@@ -1,0 +1,1192 @@
+// ЭБУ hex-тренажёр: интерфейс.
+//
+// Hex-редактор только для чтения. Поверх байтов -- два слоя:
+//   * ваш маппак (заливка): карты, кривые, оси, которые вы разметили сами
+//     и сохраняете в A2L или DAMOS;
+//   * эталон (подчёркивание): DAMOS или A2L, с которым идёт сверка. Для
+//     тренировки его можно скрыть -- тогда он молчит до сверки.
+// Адреса -- адреса CPU: база образа + смещение в файле, как Base Address
+// в Ghidra и как адреса в DAMOS/A2L.
+(function () {
+  "use strict";
+  const M = ET.model, F = ET.fmt, MK = ET.markup, CMP = ET.compare;
+  const LINE_H = 18;
+
+  // ------------------------------------------------------------ состояние
+  const S = {
+    fw: null,                 // {name, size, data, crc}
+    base: 0,
+    pack: null,               // ваш маппак (адреса -- смещения в файле)
+    ref: null,                // {name, format, raw, objects (CPU), shift, pack (смещения)}
+    hideRef: false,
+    cur: 0, sel: null, anchor: null, top: 0,
+    hist: [], fwd: [],
+    showOff: false,
+    side: "pack", packFilter: "", refFilter: "", refKind: "all",
+    probe: { w: 16, rows: 16, cell: "u8", be: false, fmt: "dec" },
+    objFmt: "phys",
+    checkOpts: { kinds: ["map", "curve"], lo: "", hi: "", reveal: false },
+    lastCheck: null, lastSearch: null,
+    undo: [], redo: [],
+  };
+
+  // ---------------------------------------------------------------- утилиты
+  const $ = (s, r) => (r || document).querySelector(s);
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  function el(tag, props, ...kids) {
+    const e = document.createElement(tag);
+    for (const k in props || {}) {
+      const v = props[k];
+      if (k === "style" && typeof v === "object") Object.assign(e.style, v);
+      else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+      else if (k === "html") e.innerHTML = v;
+      else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? "" : v);
+    }
+    for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false) e.append(c.nodeType ? c : String(c));
+    return e;
+  }
+  let toastT = 0;
+  function toast(msg, ms) {
+    const t = $("#toast");
+    t.textContent = msg; t.style.display = "block";
+    clearTimeout(toastT);
+    toastT = setTimeout(() => (t.style.display = "none"), ms || 2600);
+  }
+  function download(name, content, type) {
+    const blob = new Blob([content], { type: type || "text/plain" });
+    const a = el("a", { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  function pickFile(accept) {
+    return new Promise(res => {
+      const inp = $("#fileIn");
+      inp.value = ""; inp.accept = accept || "";
+      inp.onchange = () => res(inp.files[0] || null);
+      inp.click();
+    });
+  }
+  async function readText(file) {
+    const buf = await file.arrayBuffer();
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(buf); }
+    catch (e) { return new TextDecoder("windows-1251").decode(buf); }
+  }
+  const CRC_T = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(d) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < d.length; i++) c = CRC_T[(c ^ d[i]) & 0xFF] ^ (c >>> 8);
+    return ((c ^ 0xFFFFFFFF) >>> 0).toString(16).toUpperCase().padStart(8, "0");
+  }
+  const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } };
+
+  // ----------------------------------------------------------------- адреса
+  const size = () => (S.fw ? S.fw.size : 0);
+  const data = () => S.fw.data;
+  const hexl = (v, n) => (v >>> 0).toString(16).padStart(n || 0, "0").toUpperCase();
+  function addrW() { return Math.max(6, (S.base + Math.max(0, size() - 1)).toString(16).length); }
+  const fa = off => hexl(S.base + off, addrW());
+  const inImg = off => off >= 0 && off < size();
+  const refVisible = () => S.ref && !S.hideRef;
+
+  // "C84B78", "0xC84B78", "+1F0" (смещение в файле), имя объекта
+  function parseAddr(str) {
+    str = String(str || "").trim();
+    if (!str) return null;
+    if (/^\+/.test(str)) {
+      const v = parseInt(str.slice(1).replace(/^0x/i, ""), 16);
+      return isNaN(v) ? null : v;
+    }
+    if (S.pack) for (const o of S.pack.objects) if (o.name === str) return o.addr;
+    if (refVisible()) for (const o of S.ref.objects) if (o.name === str) return o.addr - S.base;
+    const h = str.replace(/^0x/i, "").replace(/h$/i, "");
+    if (!/^[0-9a-f]+$/i.test(h)) return null;
+    return parseInt(h, 16) - S.base;
+  }
+
+  // ------------------------------------------------------- объекты под байтом
+  function partAt(u, off) {
+    for (const p of u.geom.parts) if (off >= p.addr && off < p.addr + p.size) return p;
+    return null;
+  }
+  const PART_CLASS = { data: "obj", aR: "axis", aC: "axis", nR: "cnt", nC: "cnt", str: "str" };
+  function mineAt(off) { return S.pack ? S.pack.unitAt(off) : null; }
+  function refAt(off) { return refVisible() && S.ref.pack ? S.ref.pack.unitAt(off) : null; }
+
+  // Элемент объекта под байтом: какая часть, индекс, значение
+  function elementAt(u, off) {
+    const p = partAt(u, off);
+    if (!p) return null;
+    const o = u.item;
+    if (p.what === "str") return { p, text: "строка" };
+    const cs = M.cellOf(p.cell).size;
+    const i = Math.floor((off - p.addr) / cs);
+    const raw = M.readCell(data(), p.addr + i * cs, p.cell, o.be);
+    const u8 = s => (s ? " " + s : "");
+    if (p.what === "data") {
+      const v = M.fmtNum(raw * o.factor + o.offset, 4) + u8(o.unit);
+      if (o.kind === "map" || (o.kind === "block" && o.rows > 1)) return { p, text: "ячейка [" + Math.floor(i / o.cols) + "," + (i % o.cols) + "] = " + v };
+      if (o.kind === "value") return { p, text: "значение = " + v };
+      return { p, text: "точка [" + i + "] = " + v };
+    }
+    if (p.what === "aR" || p.what === "aC") {
+      const ax = p.what === "aR" ? o.axisR : o.axisC;
+      return { p, text: (p.what === "aR" ? "ось строк" : "ось столбцов") + " [" + i + "] = " + M.fmtNum(raw * ax.factor + ax.offset, 4) + u8(ax.unit) };
+    }
+    return { p, text: (p.what === "nR" ? "счётчик строк" : "счётчик столбцов") + " = " + raw };
+  }
+
+  // ------------------------------------------------------------------ hex
+  function visibleRows() { return Math.max(4, Math.floor($("#view").clientHeight / LINE_H)); }
+  const totalRows = () => Math.ceil(size() / 16);
+
+  function renderHead() {
+    let h = '<span class=a title="Щелчок — переключить адрес CPU / смещение в файле">' + (S.showOff ? "смещение" : "адрес") + "</span>";
+    for (let i = 0; i < 16; i++) h += '<span class="y' + (i === 7 ? " g8" : "") + '">' + hexl(i, 2) + "</span>";
+    $("#hexhead").innerHTML = h + "  <span>текст (cp1251)</span>";
+  }
+
+  function renderHex() {
+    const view = $("#view");
+    if (!S.fw) { renderWelcome(); return; }
+    renderHead();
+    const n = visibleRows();
+    S.top = Math.max(0, Math.min(S.top, totalRows() - 1));
+    const selA = S.sel ? Math.min(S.sel.a, S.sel.b) : -1, selB = S.sel ? Math.max(S.sel.a, S.sel.b) : -2;
+    const d = data();
+    const out = [];
+    const aw = S.showOff ? Math.max(6, (size() - 1).toString(16).length) : addrW();
+    for (let r = S.top; r < Math.min(totalRows(), S.top + n); r++) {
+      const base = r * 16;
+      let h = "<span class=a>" + hexl(S.showOff ? base : S.base + base, aw) + "</span>";
+      let t = "";
+      for (let i = 0; i < 16; i++) {
+        const o = base + i;
+        if (o >= size()) { h += '<span class="y' + (i === 7 ? " g8" : "") + '">  </span>'; continue; }
+        let cls = "y" + (i === 7 ? " g8" : "") + (d[o] === 0 ? " z" : "");
+        const mu = mineAt(o);
+        if (mu) { const p = partAt(mu, o); cls += " k-" + (p ? PART_CLASS[p.what] : "obj"); }
+        const ru = refAt(o);
+        if (ru) { const p = partAt(ru, o); const c = p ? PART_CLASS[p.what] : "obj"; cls += " r-" + (c === "obj" ? "data" : c); }
+        if (o === S.cur) cls += " cur";
+        if (o >= selA && o <= selB) cls += " sel";
+        h += '<span class="' + cls + '" data-o="' + o + '">' + hexl(d[o], 2) + "</span>";
+        const b = d[o], pr = M.isPrintable(b);
+        t += '<span data-o="' + o + '" class="' + (o === S.cur ? "cur " : "") + (pr ? "on" : "") + (o >= selA && o <= selB ? " sel" : "") + '">' + (pr ? esc(M.CP1251[b]) : "·") + "</span>";
+      }
+      out.push("<div class=hx>" + h + "<span class=t>" + t + "</span></div>");
+    }
+    view.innerHTML = out.join("");
+    const tr = $("#vscroll"), th = $("#vthumb");
+    const H = tr.clientHeight, part = Math.min(1, n / Math.max(1, totalRows()));
+    const tH = Math.max(18, H * part);
+    th.style.height = tH + "px";
+    th.style.top = (totalRows() > n ? (S.top / (totalRows() - n)) * (H - tH) : 0) + "px";
+  }
+
+  function renderWelcome() {
+    $("#hexhead").innerHTML = "";
+    $("#view").innerHTML = '<div id=welcome>' +
+      "<h2>Hex-редактор для разметки прошивок ЭБУ</h2><ol>" +
+      "<li><b>Прошивка…</b> — откройте .bin (или перетащите файл в окно).</li>" +
+      "<li><b>база</b> — адрес первого байта файла, как <i>Base Address</i> при загрузке в Ghidra и как адреса в DAMOS/A2L. При загрузке эталона база подбирается сама.</li>" +
+      "<li><b>Эталон DAMOS / A2L…</b> — его карты подчёркнуты в hex и перечислены на вкладке «Эталон». Для тренировки эталон можно скрыть.</li>" +
+      "<li>Размечайте свой маппак: встаньте курсором на начало карты (или выделите её байты) и нажмите <kbd>M</kbd> — карта, кривая, ось, значение. Таблица в физических единицах видна сразу.</li>" +
+      "<li><b>Мой маппак → Сохранить как A2L / DAMOS</b>. <b>Сверка</b> — что совпало с эталоном, что нет и почему.</li>" +
+      "</ol><p class=muted>Только чтение: байты прошивки не меняются. Файлы никуда не отправляются, маппак автоматически сохраняется в браузере. Клавиши — <kbd>F1</kbd>.</p></div>";
+  }
+
+  // ------------------------------------------------------------ инспектор
+  function renderInsp() {
+    const box = $("#insp");
+    if (!S.fw) { box.innerHTML = ""; return; }
+    const d = data(), o = S.cur;
+    const rd = (cell, be) => M.readCell(d, o, cell, be);
+    const fmt = v => (isFinite(v) ? M.fmtNum(v, 6) : "—");
+    const rows = [
+      ["адрес", fa(o)], ["смещение", "+" + hexl(o)],
+      ["u8 / s8", rd("u8") + " / " + rd("s8")],
+      ["двоично", d[o].toString(2).padStart(8, "0")],
+      ["u16 LE", fmt(rd("u16"))], ["s16 LE", fmt(rd("s16"))],
+      ["u16 BE", fmt(rd("u16", true))], ["s16 BE", fmt(rd("s16", true))],
+      ["u32 LE", fmt(rd("u32"))], ["u32 BE", fmt(rd("u32", true))],
+      ["f32 LE", fmt(rd("f32"))], ["f32 BE", fmt(rd("f32", true))],
+    ];
+    let h = "<table>" + rows.map(([k, v]) => "<tr><td>" + k + "</td><td>" + esc(v) + "</td></tr>").join("") + "</table>";
+    if (S.sel) {
+      const [a, b] = selRange();
+      h += "<h4>Выделено</h4><table><tr><td>байт</td><td>" + (b - a) + " (0x" + hexl(b - a) + ")</td></tr><tr><td>с</td><td>" + fa(a) + "</td></tr><tr><td>по</td><td>" + fa(b - 1) + "</td></tr></table>";
+    }
+    const objBox = (u, ref) => {
+      const e = elementAt(u, o);
+      return '<div class="objbox' + (ref ? " ref" : "") + '"><b>' + esc(u.item.name || "(без имени)") + "</b><br><span class=muted>" + esc(M.describe(u.item)) + "</span>" +
+        (e ? "<br>" + esc(e.text) : "") + (ref && u.item.desc ? "<br><span class=muted>" + esc(u.item.desc) + "</span>" : "") + "</div>";
+    };
+    const mu = mineAt(o), ru = refAt(o);
+    h += "<h4>Мой маппак</h4>" + (mu ? objBox(mu, false) : "<div class=muted>—</div>");
+    if (S.ref) h += "<h4>Эталон</h4>" + (S.hideRef ? "<div class=muted>скрыт (тренировка)</div>" : ru ? objBox(ru, true) : "<div class=muted>—</div>");
+    h += '<div class=legend><span><i class=k-obj></i>данные</span><span><i class=k-axis></i>ось</span><span><i class=k-cnt></i>счётчик</span>' +
+      (refVisible() ? '<span><i style="box-shadow: inset 0 -3px 0 var(--ref)"></i>эталон</span>' : "") + "</div>";
+    box.innerHTML = h;
+  }
+
+  // --------------------------------------------------------- нижняя панель
+  function heat(v, lo, hi) {
+    if (!isFinite(v) || hi <= lo) return "";
+    const t = (v - lo) / (hi - lo);
+    return "background:hsla(" + Math.round(220 - 220 * t) + ",75%,52%,.28)";
+  }
+  const fmtVal = v => M.fmtNum(v, 3);
+
+  function tableHtml(values, cols, rows, axC, axR, fmt) {
+    const fin = values.filter(isFinite);
+    const lo = fin.length ? Math.min(...fin) : 0, hi = fin.length ? Math.max(...fin) : 0;
+    let h = "<table class=map><tr><th class=corner>" + (rows > 1 ? "стр\\стлб" : "") + "</th>";
+    for (let c = 0; c < cols; c++) h += "<th>" + (axC && axC[c] !== undefined ? fmtVal(axC[c]) : c) + "</th>";
+    h += "</tr>";
+    for (let r = 0; r < rows; r++) {
+      h += "<tr><th>" + (axR && axR[r] !== undefined ? fmtVal(axR[r]) : r) + "</th>";
+      for (let c = 0; c < cols; c++) {
+        const v = values[r * cols + c];
+        h += '<td style="' + heat(v, lo, hi) + '">' + fmt(v) + "</td>";
+      }
+      h += "</tr>";
+    }
+    return h + "</table>";
+  }
+
+  function plot(values, w, h) {
+    const cv = el("canvas", { class: "plot", width: w, height: h });
+    const g = cv.getContext("2d");
+    const fin = values.filter(isFinite);
+    if (!fin.length) return cv;
+    const lo = Math.min(...fin), hi = Math.max(...fin);
+    const css = getComputedStyle(document.documentElement);
+    g.strokeStyle = css.getPropertyValue("--line"); g.lineWidth = 1;
+    g.strokeRect(0.5, 0.5, w - 1, h - 1);
+    g.strokeStyle = css.getPropertyValue("--obj"); g.lineWidth = 1.5;
+    g.beginPath();
+    values.forEach((v, i) => {
+      const x = 4 + (w - 8) * (values.length > 1 ? i / (values.length - 1) : 0.5);
+      const y = h - 4 - (h - 8) * (hi > lo ? (v - lo) / (hi - lo) : 0.5);
+      if (i) g.lineTo(x, y); else g.moveTo(x, y);
+    });
+    g.stroke();
+    g.fillStyle = css.getPropertyValue("--muted"); g.font = "11px sans-serif";
+    g.fillText(fmtVal(hi), 6, 13); g.fillText(fmtVal(lo), 6, h - 6);
+    return cv;
+  }
+
+  function myAxisAt(off) { return S.pack.objects.find(o => o.addr === off && o.kind === "axis") || null; }
+  function refAxisAt(off) { return S.ref.pack.objects.find(o => o.addr === off && o.kind === "axis") || null; }
+
+  function renderBottom() {
+    const bar = $("#bottombar"), body = $("#bottombody");
+    bar.innerHTML = ""; body.innerHTML = "";
+    if (!S.fw) { bar.append(el("span", { class: "muted" }, "Просмотр")); return; }
+    const mu = mineAt(S.cur);
+    if (mu) return objPanel(mu.item, false, bar, body);
+    const ru = refAt(S.cur);
+    if (ru) return objPanel(ru.item, true, bar, body);
+    probePanel(bar, body);
+  }
+
+  function objPanel(o, isRef, bar, body) {
+    const r = M.readObject(o, data(), a => a, isRef ? refAxisAt : myAxisAt);
+    const fmtSel = el("select", { onchange: e => { S.objFmt = e.target.value; renderBottom(); } },
+      ...[["phys", "физ."], ["raw", "сырое"], ["hex", "hex"]].map(([v, t]) => el("option", { value: v, selected: S.objFmt === v }, t)));
+    bar.append(el("span", { class: "badge", style: { color: isRef ? "var(--ref)" : "var(--obj)" } }, isRef ? "эталон" : "мой маппак"),
+      el("b", { class: "mono" }, o.name || "(без имени)"), el("span", { class: "muted" }, M.describe(o)), fmtSel);
+    if (isRef) bar.append(el("button", { onclick: () => adoptRef([refOrig(o)]) }, "Взять в маппак"));
+    else bar.append(el("button", { onclick: () => mapDialog(o) }, "Изменить (M)"),
+      el("button", { onclick: () => change(() => S.pack.remove(o)) }, "Удалить (Del)"));
+    const cs = M.cellOf(o.cell).size;
+    const fmt = S.objFmt === "phys" ? fmtVal : S.objFmt === "raw" ? (v => String(v)) : (v => hexl(v < 0 ? v + Math.pow(2, 8 * cs) : v, 2 * cs));
+    const vals = S.objFmt === "phys" ? r.values : (r.raw || []);
+    if (o.desc) body.append(el("div", { class: "hint" }, o.desc));
+    if (o.layout === "bosch") {
+      const bad = [];
+      if ("nR" in r.counts && r.counts.nR !== o.rows) bad.push("строк в заголовке " + r.counts.nR);
+      if ("nC" in r.counts && r.counts.nC !== o.cols) bad.push("столбцов в заголовке " + r.counts.nC);
+      if (bad.length) body.append(el("div", { class: "bad" }, "Заголовок не сходится с размером: " + bad.join(", ")));
+    }
+    if (o.kind === "string") { body.append(el("div", { class: "mono" }, '"' + (r.text || "") + '"')); return; }
+    if (o.kind === "value") { body.append(el("div", { class: "score mono" }, fmt(vals[0]) + (S.objFmt === "phys" && o.unit ? " " + o.unit : ""))); return; }
+    const rows = (o.kind === "map" || o.kind === "block") ? o.rows : 1;
+    const wrap = el("div", { style: { display: "flex", gap: "16px", alignItems: "flex-start", flexWrap: "wrap" } });
+    wrap.append(el("div", { html: tableHtml(vals, o.cols, rows, r.axisC, o.kind === "map" ? r.axisR : null, fmt) }));
+    if (rows === 1 && o.cols > 2) wrap.append(plot(vals, Math.min(700, Math.max(300, o.cols * 18)), 140));
+    body.append(wrap);
+  }
+
+  function probePanel(bar, body) {
+    const p = S.probe;
+    const num = (key, min, max) => el("input", { type: "number", value: p[key], min, max, style: { width: "64px" },
+      onchange: e => { p[key] = Math.max(min, Math.min(max, parseInt(e.target.value, 10) || min)); renderBottom(); } });
+    bar.append(el("b", {}, "Сетка у курсора"),
+      el("button", { title: "Уже ( - )", onclick: () => { p.w = Math.max(1, p.w - 1); renderBottom(); } }, "−"),
+      el("span", {}, "ширина"), num("w", 1, 64),
+      el("button", { title: "Шире ( + )", onclick: () => { p.w = Math.min(64, p.w + 1); renderBottom(); } }, "+"),
+      el("span", {}, "строк"), num("rows", 1, 64),
+      el("select", { onchange: e => { p.cell = e.target.value; renderBottom(); } },
+        ...Object.keys(M.CELLS).map(c => el("option", { value: c, selected: p.cell === c }, c))),
+      el("label", {}, el("input", { type: "checkbox", checked: p.be, onchange: e => { p.be = e.target.checked; renderBottom(); } }), " BE"),
+      el("select", { onchange: e => { p.fmt = e.target.value; renderBottom(); } },
+        el("option", { value: "dec", selected: p.fmt === "dec" }, "dec"), el("option", { value: "hex", selected: p.fmt === "hex" }, "hex")),
+      el("button", { onclick: () => mapDialog(null, { kind: p.rows > 1 ? "map" : "curve", cols: p.w, rows: p.rows, cell: p.cell, be: p.be }) }, "Разметить так… (M)"));
+    const cs = M.cellOf(p.cell).size;
+    const vals = [];
+    for (let i = 0; i < p.w * p.rows; i++) vals.push(M.readCell(data(), S.cur + i * cs, p.cell, p.be));
+    const fmt = p.fmt === "hex" ? (v => isFinite(v) ? hexl(v < 0 ? v + Math.pow(2, 8 * cs) : v, 2 * cs) : "—") : (v => isFinite(v) ? String(v) : "—");
+    const wrap = el("div", { style: { display: "flex", gap: "16px", alignItems: "flex-start", flexWrap: "wrap" } });
+    wrap.append(el("div", { html: tableHtml(vals, p.w, p.rows, null, null, fmt) }));
+    const prof = [];
+    for (let i = 0; i < 512; i++) { const v = M.readCell(data(), S.cur + i * cs, p.cell, p.be); if (!isFinite(v)) break; prof.push(v); }
+    wrap.append(el("div", {}, el("div", { class: "hint" }, "Профиль 512 ячеек от курсора — у карты видны «зубья» с периодом в ширину строки"), plot(prof, 520, 150)));
+    body.append(wrap);
+  }
+
+  // ----------------------------------------------------------- боковая панель
+  function renderSide() {
+    const b = $("#sidebody");
+    const keep = document.activeElement && b.contains(document.activeElement) && document.activeElement.dataset.keep;
+    b.innerHTML = "";
+    if (!S.fw) { b.append(el("div", { class: "empty" }, "Откройте прошивку.")); return; }
+    ({ pack: sidePack, ref: sideRef, check: sideCheck })[S.side](b);
+    if (keep) { const i = b.querySelector('[data-keep="' + keep + '"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }
+  }
+
+  const kindText = o => M.KINDS[o.kind] + (o.kind === "map" ? " " + o.cols + "×" + o.rows : (o.kind === "value" || o.kind === "string") ? "" : " " + o.cols);
+
+  function objList(container, items, offOf, curUnit) {
+    const list = el("div", { class: "list" });
+    for (const o of items.slice(0, 3000)) {
+      const off = offOf(o);
+      list.append(el("div", { class: "item" + (curUnit && curUnit.item.name === o.name && curUnit.off === off ? " on" : ""),
+        title: o.desc || "", onclick: () => goTo(off) },
+        el("span", { class: "addr" }, hexl(S.base + off, addrW())), el("span", { class: "nm" }, o.name || "(без имени)"), el("span", { class: "kd" }, kindText(o))));
+    }
+    if (items.length > 3000) list.append(el("div", { class: "hint" }, "показаны первые 3000 из " + items.length + " — уточните фильтр"));
+    container.append(list);
+  }
+
+  function sidePack(b) {
+    const objs = S.pack.objects.slice().sort((x, y) => x.addr - y.addr);
+    const f = S.packFilter.toLowerCase();
+    const shown = objs.filter(o => !f || (o.name || "").toLowerCase().includes(f) || fa(o.addr).toLowerCase().includes(f));
+    b.append(el("div", { class: "row" },
+      el("input", { placeholder: "фильтр по имени или адресу", value: S.packFilter, style: { flex: "1" }, "data-keep": "pf",
+        oninput: e => { S.packFilter = e.target.value; renderSide(); } }),
+      el("button", { title: "Новый объект у курсора", onclick: () => mapDialog(null) }, "+ M")));
+    b.append(el("div", { class: "hint" }, objs.length + " объектов" + (shown.length !== objs.length ? ", показано " + shown.length : "")));
+    if (!objs.length) b.append(el("div", { class: "empty" }, "Маппак пуст. Встаньте на начало карты (или выделите её байты) и нажмите M. Сохраняется в A2L или DAMOS через меню «Мой маппак»."));
+    objList(b, shown, o => o.addr, mineAt(S.cur));
+  }
+
+  function sideRef(b) {
+    if (!S.ref) { b.append(el("div", { class: "empty" }, "Эталон не загружен. Откройте DAMOS (.dam) или A2L кнопкой «Эталон DAMOS / A2L…» или перетащите файл в окно.")); return; }
+    const inside = S.ref.objects.filter(o => inImg(o.addr - S.base)).length;
+    b.append(el("div", { class: "hint" }, S.ref.name + " — " + S.ref.format + ", " + S.ref.objects.length + " объектов, в образе " + inside +
+      (S.ref.shift ? ", адреса сдвинуты на " + (S.ref.shift > 0 ? "+" : "-") + "0x" + hexl(Math.abs(S.ref.shift)) : "")));
+    b.append(el("div", { class: "row" }, el("label", {}, el("input", { type: "checkbox", checked: S.hideRef, onchange: e => { S.hideRef = e.target.checked; saveSoon(); renderAll(); } }),
+      " Скрыть эталон"), el("span", { class: "hint" }, "тренировка: размечайте сами, потом «Сверка»")));
+    if (S.hideRef) { b.append(el("div", { class: "empty" }, "Эталон скрыт: нет подчёркивания в hex и списка. Сверка работает.")); return; }
+    const kinds = [["all", "все виды"]].concat(Object.entries(M.KINDS));
+    b.append(el("div", { class: "row" },
+      el("input", { placeholder: "имя, описание или адрес", value: S.refFilter, style: { flex: "1" }, "data-keep": "rf",
+        oninput: e => { S.refFilter = e.target.value; renderSide(); } }),
+      el("select", { onchange: e => { S.refKind = e.target.value; renderSide(); } }, ...kinds.map(([k, t]) => el("option", { value: k, selected: S.refKind === k }, t)))));
+    const f = S.refFilter.toLowerCase();
+    const shown = S.ref.objects.filter(o => (S.refKind === "all" || o.kind === S.refKind) &&
+      (!f || o.name.toLowerCase().includes(f) || (o.desc || "").toLowerCase().includes(f) || hexl(o.addr).toLowerCase().includes(f)))
+      .sort((x, y) => x.addr - y.addr);
+    b.append(el("div", { class: "row" }, el("span", { class: "hint" }, "показано " + shown.length),
+      el("button", { title: "Скопировать показанные объекты эталона в ваш маппак — например, чтобы пересохранить DAMOS как A2L", onclick: () => adoptRef(shown) }, "Взять показанные в маппак")));
+    objList(b, shown, o => o.addr - S.base, refAt(S.cur));
+  }
+
+  const KIND_OPTS = [["map", "карты"], ["curve", "кривые"], ["axis", "оси"], ["value", "значения"], ["block", "блоки"], ["string", "строки"]];
+  function kindBoxes(arr) {
+    return el("div", { class: "row" }, ...KIND_OPTS.map(([k, t]) => el("label", {},
+      el("input", { type: "checkbox", checked: arr.includes(k), onchange: e => {
+        const i = arr.indexOf(k);
+        if (e.target.checked && i < 0) arr.push(k); else if (!e.target.checked && i >= 0) arr.splice(i, 1);
+      } }), " " + t)));
+  }
+  const parseHexOpt = s => (s && /^(0x)?[0-9a-f]+$/i.test(s) ? parseInt(s.replace(/^0x/i, ""), 16) : null);
+
+  function runCheck() {
+    const o = S.checkOpts;
+    S.lastCheck = CMP.compare(MK.cpuObjects(S.pack, S.base), S.ref.objects, {
+      kinds: new Set(o.kinds), lo: parseHexOpt(o.lo), hi: parseHexOpt(o.hi),
+    });
+  }
+
+  function sideCheck(b) {
+    if (!S.ref) { b.append(el("div", { class: "empty" }, "Загрузите эталон: DAMOS (.dam) или A2L.")); return; }
+    const o = S.checkOpts;
+    b.append(el("div", { class: "hint" }, "Ваш маппак (" + S.pack.objects.length + ") против " + S.ref.name + ". Пара ищется по адресу, имя может быть любым."),
+      el("div", { class: "sec" }, "Что проверять"), kindBoxes(o.kinds),
+      el("div", { class: "row" }, "адреса",
+        el("input", { class: "mono", placeholder: "от", value: o.lo, style: { width: "92px" }, onchange: e => (o.lo = e.target.value.trim()) }), "—",
+        el("input", { class: "mono", placeholder: "до", value: o.hi, style: { width: "92px" }, onchange: e => (o.hi = e.target.value.trim()) })),
+      el("div", { class: "row" },
+        el("button", { title: "Только та область, где вы размечали", onclick: () => {
+          const uo = MK.cpuObjects(S.pack, S.base);
+          if (!uo.length) { toast("Маппак пуст"); return; }
+          o.lo = hexl(Math.min(...uo.map(x => x.addr))); o.hi = hexl(Math.max(...uo.map(x => M.geometry(x).end)));
+          renderSide();
+        } }, "по моей разметке"),
+        el("button", { onclick: () => { o.lo = ""; o.hi = ""; renderSide(); } }, "вся прошивка"),
+        el("button", { class: "primary", onclick: () => { runCheck(); renderSide(); } }, "Сверить")));
+    if (S.lastCheck) runCheck();     // маппак мог измениться
+    const res = S.lastCheck;
+    if (!res) return;
+    b.append(el("div", { class: "row" }, el("span", { class: "score" }, (res.score * 100).toFixed(res.score < 0.1 ? 1 : 0) + "%"),
+      el("span", { class: "hint" }, "найдено " + res.inScopePairs.length + " из " + res.total + "; верно полностью " + res.ok + ", частично " + res.partial)));
+    const sect = (title, cls, items, render) => {
+      b.append(el("div", { class: "sec" }, title, el("span", { class: "badge " + cls }, items.length)));
+      const l = el("div", { class: "list" });
+      items.slice(0, 500).forEach(x => l.append(render(x)));
+      if (items.length > 500) l.append(el("div", { class: "hint" }, "показаны первые 500"));
+      b.append(l);
+    };
+    const pairItem = p => el("div", { class: "item", onclick: () => { goTo(p.u.addr - S.base); pairDialog(p); } },
+      el("span", { class: "addr" }, hexl(p.u.addr, addrW())), el("span", { class: "nm" }, p.r.name),
+      el("span", { class: "kd " + (p.status === "ok" ? "ok" : "warn") }, p.status === "ok" ? "✔" : p.checks.filter(c => !c.ok).map(c => c.what).join(", ")));
+    sect("Совпало", "ok", res.inScopePairs.filter(p => p.status === "ok"), pairItem);
+    sect("Частично", "warn", res.inScopePairs.filter(p => p.status !== "ok"), pairItem);
+    sect("Нет в эталоне", "bad", res.extra, u => el("div", { class: "item", onclick: () => goTo(u.addr - S.base) },
+      el("span", { class: "addr" }, hexl(u.addr, addrW())), el("span", { class: "nm" }, u.name || "(без имени)"), el("span", { class: "kd" }, M.KINDS[u.kind])));
+    const out = res.pairs.length - res.inScopePairs.length;
+    if (out) b.append(el("div", { class: "hint" }, "Ещё совпавших с эталоном вне выбранных видов или диапазона: " + out));
+    if (!o.reveal) {
+      b.append(el("div", { class: "sec" }, "Пропущено", el("span", { class: "badge" }, res.missing.length)),
+        el("div", { class: "row" }, el("button", { onclick: () => { o.reveal = true; renderSide(); } }, "Показать пропущенные (это подсказка!)")));
+    } else {
+      sect("Пропущено", "", res.missing, r => el("div", { class: "item", title: r.desc || "", onclick: () => { goTo(r.addr - S.base); refDialog(r); } },
+        el("span", { class: "addr" }, hexl(r.addr, addrW())), el("span", { class: "nm" }, r.name), el("span", { class: "kd" }, kindText(r))));
+      b.append(el("div", { class: "row" }, el("button", { onclick: () => { o.reveal = false; renderSide(); } }, "Скрыть пропущенные")));
+    }
+  }
+
+  // ----------------------------------------------------------------- навигация
+  function ensureVisible() {
+    const n = visibleRows(), r = S.cur >> 4;
+    if (r < S.top) S.top = r;
+    else if (r >= S.top + n) S.top = r - n + 1;
+  }
+  function setCur(off, extend) {
+    if (!S.fw) return;
+    off = Math.max(0, Math.min(size() - 1, off));
+    if (extend) {
+      if (S.anchor === null) S.anchor = S.cur;
+      S.sel = { a: S.anchor, b: off };
+    } else { S.sel = null; S.anchor = off; }
+    const pm = mineAt(S.cur), pr = refAt(S.cur);
+    S.cur = off;
+    ensureVisible();
+    renderHex(); renderInsp(); renderStatus();
+    // нижнюю панель перерисовываем, только когда сменился объект под курсором
+    const m = mineAt(off), r = refAt(off);
+    const same = (a, b) => (a ? a.item : null) === (b ? b.item : null);
+    if (!(m || r) || !same(m, pm) || !same(r, pr)) renderBottom();
+  }
+  function goTo(off, noHist) {
+    if (!S.fw || !inImg(off)) { toast("Адрес вне образа — проверьте базу"); return; }
+    if (!noHist) { S.hist.push(S.cur); if (S.hist.length > 200) S.hist.shift(); S.fwd = []; }
+    S.cur = off; S.sel = null; S.anchor = off;
+    S.top = Math.max(0, (off >> 4) - 3);
+    renderAll();
+    $("#view").focus();
+  }
+  function back() { if (S.hist.length) { S.fwd.push(S.cur); goTo(S.hist.pop(), true); } }
+  function forward() { if (S.fwd.length) { S.hist.push(S.cur); goTo(S.fwd.pop(), true); } }
+
+  function selRange() {
+    if (S.sel) return [Math.min(S.sel.a, S.sel.b), Math.max(S.sel.a, S.sel.b) + 1];
+    return [S.cur, S.cur + 1];
+  }
+
+  // следующий/предыдущий объект -- ваш или эталона
+  function jumpObject(dir) {
+    const starts = [];
+    for (const u of S.pack.units()) starts.push(u.off);
+    if (refVisible()) for (const u of S.ref.pack.units()) if (inImg(u.off)) starts.push(u.off);
+    if (!starts.length) { toast("Объектов нет"); return; }
+    starts.sort((a, b) => a - b);
+    let t = null;
+    if (dir > 0) t = starts.find(s => s > S.cur);
+    else for (const s of starts) if (s < S.cur) t = s;
+    if (t === null || t === undefined) { toast(dir > 0 ? "Дальше объектов нет" : "Раньше объектов нет"); return; }
+    goTo(t);
+  }
+
+  // -------------------------------------------------------- изменения и отмена
+  function change(fn) {
+    if (!S.fw) return;
+    const before = JSON.stringify(S.pack.toJSON());
+    if (fn() === false) return;
+    S.undo.push(before); if (S.undo.length > 80) S.undo.shift();
+    S.redo = [];
+    S.pack.touch();
+    saveSoon();
+    renderAll();
+  }
+  function restorePack(js) { S.pack = MK.Pack.fromJSON(JSON.parse(js), size()); saveSoon(); renderAll(); }
+  function undo() { if (!S.undo.length) { toast("Отменять нечего"); return; } S.redo.push(JSON.stringify(S.pack.toJSON())); restorePack(S.undo.pop()); toast("Отменено"); }
+  function redo() { if (!S.redo.length) return; S.undo.push(JSON.stringify(S.pack.toJSON())); restorePack(S.redo.pop()); }
+
+  function nameTaken(name, except) {
+    return !!name && S.pack.objects.some(o => o !== except && o.name === name);
+  }
+
+  // Объекты эталона -> в маппак (с адресами-смещениями)
+  function refOrig(o) { return S.ref.objects.find(r => r.addr - S.base === o.addr && r.name === o.name) || MK.shift(o, S.base); }
+  function adoptRef(list) {
+    if (!list.length) return;
+    let added = 0, skipped = 0;
+    change(() => {
+      for (const r of list) {
+        const o = MK.shift(r, -S.base);
+        delete o.source; delete o.typ;
+        if (!inImg(o.addr)) { skipped++; continue; }
+        if (S.pack.objects.some(x => x.addr === o.addr && x.name === o.name)) { skipped++; continue; }
+        if (nameTaken(o.name)) o.name = o.name + "_" + hexl(S.base + o.addr);
+        S.pack.add(o); added++;
+      }
+      if (!added) return false;
+    });
+    toast("В маппак добавлено: " + added + (skipped ? ", пропущено (уже есть или вне образа): " + skipped : ""), 4000);
+  }
+
+  // ---------------------------------------------------- карта / кривая / ось
+  function mapDialog(existing, preset) {
+    if (!S.fw) return;
+    const o = M.normalize(existing ? JSON.parse(JSON.stringify(existing)) : Object.assign({
+      kind: "map", addr: S.cur, cols: 16, rows: 16, cell: "u8", name: "",
+    }, preset || {}));
+    if (!existing && S.sel) {
+      const [a, b] = selRange();
+      o.addr = a;
+      if (!preset) {
+        const n = b - a;
+        if (n <= 64) { o.kind = "curve"; o.cols = n; o.rows = 1; }
+        else o.rows = Math.max(1, Math.floor(n / o.cols));
+      }
+    }
+    const f = {};
+    const inp = (k, w, cls) => (f[k] = el("input", { value: o[k] === undefined ? "" : o[k], class: cls || "", style: { width: w || "100%" } }));
+    const selOf = (k, opts, val) => (f[k] = el("select", {}, ...opts.map(([v, t]) => el("option", { value: v, selected: String(val) === String(v) }, t))));
+    const cellOpts = Object.keys(M.CELLS).map(c => [c, c]);
+    inp("name"); inp("desc");
+    f.addr = el("input", { class: "mono", value: hexl(S.base + o.addr), style: { width: "120px" } });
+    selOf("kind", Object.entries(M.KINDS), o.kind);
+    selOf("layout", [["plain", "по адресу сразу данные"], ["bosch", "заголовок Bosch: счётчики и оси перед данными"]], o.layout);
+    selOf("order", [["R", "сначала строки (nR nC aR aC) — как у Bosch"], ["C", "сначала столбцы (nC nR aC aR)"]], (o.header && o.header[0] === "nC" && o.kind === "map") ? "C" : "R");
+    selOf("countSize", [[1, "1 байт"], [2, "2 байта"]], o.countSize);
+    f.cols = el("input", { type: "number", min: 1, value: o.cols, style: { width: "80px" } });
+    f.rows = el("input", { type: "number", min: 1, value: o.rows, style: { width: "80px" } });
+    f.length = el("input", { type: "number", min: 1, value: o.length || 16, style: { width: "80px" } });
+    selOf("cell", cellOpts, o.cell);
+    f.be = el("input", { type: "checkbox", checked: !!o.be });
+    inp("factor", "110px", "mono"); inp("offset", "110px", "mono"); inp("unit", "110px");
+    const axisUi = (key, title) => {
+      const a = o[key];
+      const g = {};
+      g.mode = el("select", {}, ...[["none", "нет"], ["inline", "в записи (заголовок)"], ["ref", "отдельная ось по адресу"]].map(([v, t]) => el("option", { value: v, selected: a.mode === v }, t)));
+      g.ref = el("input", { class: "mono", style: { width: "130px" }, value: a.mode === "ref" && a.ref !== null ? hexl(S.base + a.ref) : "", placeholder: "адрес или имя оси" });
+      g.cell = el("select", {}, ...cellOpts.map(([v]) => el("option", { value: v, selected: a.cell === v }, v)));
+      g.factor = el("input", { class: "mono", value: a.factor, style: { width: "90px" } });
+      g.offset = el("input", { class: "mono", value: a.offset, style: { width: "90px" } });
+      g.unit = el("input", { value: a.unit || "", style: { width: "80px" } });
+      g.box = el("fieldset", {}, el("legend", {}, title),
+        el("div", { class: "row" }, g.mode, g.ref, el("span", { class: "muted" }, "точки"), g.cell),
+        el("div", { class: "row" }, "×", g.factor, "+", g.offset, "ед.", g.unit));
+      return g;
+    };
+    const axC = axisUi("axisC", "Ось столбцов — быстрый индекс: соседние ячейки в памяти");
+    const axR = axisUi("axisR", "Ось строк — медленный индекс");
+    const info = el("div", { class: "hint mono" });
+    const prev = el("div", { style: { overflow: "auto", maxHeight: "34vh", marginTop: "6px" } });
+    const numOr = (s, d) => { const v = parseFloat(String(s).replace(",", ".")); return isNaN(v) ? d : v; };
+
+    function collect() {
+      const n = {
+        name: f.name.value.trim().replace(/\s+/g, "_"), desc: f.desc.value.trim(), kind: f.kind.value,
+        addr: parseInt(f.addr.value.replace(/^0x/i, ""), 16) - S.base,
+        layout: f.layout.value, countSize: +f.countSize.value,
+        cols: Math.max(1, parseInt(f.cols.value, 10) || 1), rows: Math.max(1, parseInt(f.rows.value, 10) || 1),
+        length: Math.max(1, parseInt(f.length.value, 10) || 1),
+        cell: f.cell.value, be: f.be.checked,
+        factor: numOr(f.factor.value, 1), offset: numOr(f.offset.value, 0), unit: f.unit.value.trim(),
+      };
+      if (n.layout === "bosch") n.header = n.kind === "map" ? (f.order.value === "C" ? ["nC", "nR", "aC", "aR"] : ["nR", "nC", "aR", "aC"]) : ["nC", "aC"];
+      for (const [key, g] of [["axisC", axC], ["axisR", axR]]) {
+        n[key] = { mode: g.mode.value, ref: g.mode.value === "ref" ? parseAddr(g.ref.value) : null, cell: g.cell.value,
+                   factor: numOr(g.factor.value, 1), offset: numOr(g.offset.value, 0), unit: g.unit.value.trim() };
+      }
+      if (n.kind === "string") n.layout = "plain";
+      return M.normalize(n);
+    }
+    function refresh() {
+      const kind = f.kind.value;
+      axR.box.style.display = kind === "map" ? "" : "none";
+      axC.box.style.display = (kind === "map" || kind === "curve") ? "" : "none";
+      f.rows.disabled = kind !== "map" && kind !== "block";
+      f.cols.disabled = kind === "value" || kind === "string";
+      lenBox.style.display = kind === "string" ? "" : "none";
+      f.order.disabled = f.layout.value !== "bosch" || kind !== "map";
+      f.countSize.disabled = f.layout.value !== "bosch";
+      for (const g of [axC, axR]) {
+        g.ref.style.display = g.mode.value === "ref" ? "" : "none";
+        // отдельная ось: масштаб и единицу по умолчанию берём у неё самой
+        if (g.mode.value === "ref" && g.factor.value === "1" && g.offset.value === "0" && !g.unit.value) {
+          const ax = myAxisAt(parseAddr(g.ref.value));
+          if (ax) { g.factor.value = ax.factor; g.offset.value = ax.offset; g.unit.value = ax.unit || ""; g.cell.value = ax.cell; }
+        }
+      }
+      const n = collect();
+      if (isNaN(n.addr) || !inImg(n.addr)) { info.textContent = "адрес вне образа"; prev.innerHTML = ""; return; }
+      const g = M.geometry(n);
+      const warn = [];
+      if (g.end > size()) warn.push("выходит за конец образа");
+      const busy = S.pack.overlapping(g.start, g.end).filter(u => u.item !== existing);
+      if (busy.length) warn.push("пересекается с вашими объектами: " + busy.map(u => u.item.name || fa(u.off)).slice(0, 4).join(", "));
+      for (const [key, t] of [["axisC", "столбцов"], ["axisR", "строк"]]) {
+        const a = n[key];
+        const used = n.kind === "map" || (n.kind === "curve" && key === "axisC");
+        if (used && a.mode === "ref") {
+          if (a.ref === null) warn.push("ось " + t + ": не понял адрес");
+          else if (!myAxisAt(a.ref)) warn.push("ось " + t + ": по " + fa(a.ref) + " в маппаке нет оси — разметьте её отдельно, вид «ось»");
+        }
+        if (used && a.mode === "inline" && n.layout !== "bosch") warn.push("ось " + t + " «в записи» бывает только с заголовком");
+      }
+      const r = M.readObject(n, data(), x => x, myAxisAt);
+      if (n.layout === "bosch") {
+        if ("nR" in r.counts) warn.push("в заголовке строк: " + r.counts.nR + (r.counts.nR === n.rows ? " ✔" : " ✗"));
+        if ("nC" in r.counts) warn.push("в заголовке столбцов: " + r.counts.nC + (r.counts.nC === n.cols ? " ✔" : " ✗"));
+      }
+      info.innerHTML = esc(fa(g.start) + "–" + fa(g.end - 1) + "  (" + (g.end - g.start) + " байт), данные с " + fa(g.dataAddr)) +
+        (warn.length ? "<br>" + warn.map(esc).join("<br>") : "");
+      if (n.kind === "value") prev.innerHTML = '<div class="score mono">' + fmtVal(r.values[0]) + " " + esc(n.unit) + "</div>";
+      else if (n.kind === "string") prev.innerHTML = '<div class=mono>"' + esc(r.text || "") + '"</div>';
+      else prev.innerHTML = tableHtml(r.values, n.cols, (n.kind === "map" || n.kind === "block") ? n.rows : 1, r.axisC, n.kind === "map" ? r.axisR : null, fmtVal);
+    }
+    const readHdr = el("button", { onclick: () => {
+      const n = collect();
+      if (n.layout !== "bosch") { toast("Только для раскладки с заголовком"); return; }
+      const r = M.readObject(n, data(), x => x);
+      if ("nC" in r.counts) f.cols.value = r.counts.nC;
+      if ("nR" in r.counts) f.rows.value = r.counts.nR;
+      refresh();
+    } }, "Размер из заголовка");
+    const step = (inpEl, d) => () => { inpEl.value = Math.max(1, (+inpEl.value || 1) + d); refresh(); };
+    const lenBox = el("span", {}, "длина ", f.length);
+    const body = el("div", { style: { minWidth: "min(880px, 90vw)" } },
+      el("div", { class: "form" },
+        el("label", {}, "Имя"), f.name, el("label", {}, "Описание"), f.desc,
+        el("label", {}, "Вид"), el("div", { class: "row" }, f.kind, "адрес", f.addr, lenBox),
+        el("label", {}, "Раскладка"), el("div", { class: "row" }, f.layout, f.order, "счётчик", f.countSize, readHdr),
+        el("label", {}, "Размер"), el("div", { class: "row" }, "столбцов", el("button", { onclick: step(f.cols, -1) }, "−"), f.cols, el("button", { onclick: step(f.cols, 1) }, "+"),
+          "строк", el("button", { onclick: step(f.rows, -1) }, "−"), f.rows, el("button", { onclick: step(f.rows, 1) }, "+")),
+        el("label", {}, "Ячейка"), el("div", { class: "row" }, f.cell, el("label", {}, f.be, " big-endian")),
+        el("label", {}, "Пересчёт"), el("div", { class: "row" }, "физ = сырое ×", f.factor, "+", f.offset, "единица", f.unit)),
+      axC.box, axR.box, info, prev);
+    body.addEventListener("input", refresh);
+    body.addEventListener("change", refresh);
+    const btns = [];
+    if (existing) btns.push({ text: "Удалить", run: () => change(() => S.pack.remove(existing)) });
+    btns.push({ text: "Сохранить", primary: true, run: () => {
+      const n = collect();
+      if (!inImg(n.addr) || M.geometry(n).end > size()) { toast("Объект вне образа"); return false; }
+      if (nameTaken(n.name, existing)) { toast("Имя «" + n.name + "» уже есть в маппаке"); return false; }
+      if (!n.name) n.name = (n.kind === "axis" ? "AX_" : n.kind === "map" ? "KF_" : n.kind === "curve" ? "KL_" : "W_") + hexl(S.base + n.addr);
+      S.cur = n.addr; S.sel = null; S.anchor = n.addr;
+      change(() => { if (existing) S.pack.remove(existing); S.pack.add(n); });
+    } });
+    dialog((existing ? "Изменить: " : "Новый объект: ") + "карта / кривая / ось — M", body, btns);
+    refresh();
+    f.name.focus();
+  }
+
+  // ---- карточки сверки и эталона
+  function pairDialog(p) {
+    const t = el("table", { class: "chk" }, el("tr", {}, el("td", {}, ""), el("td", {}, el("b", {}, "Проверка")), el("td", {}, el("b", {}, "У вас")), el("td", {}, el("b", {}, "В эталоне"))));
+    for (const c of p.checks) {
+      t.append(el("tr", {}, el("td", { class: c.ok ? "ok" : "bad" }, c.ok ? "✔" : "✗"), el("td", {}, c.what, c.note ? el("div", { class: "hint" }, c.note) : null),
+        el("td", { class: "mono" }, String(c.user)), el("td", { class: "mono" }, String(c.ref))));
+    }
+    dialog((p.u.name || "") + " ↔ " + p.r.name + " — " + (p.status === "ok" ? "совпало" : "частично"),
+      el("div", {}, p.r.desc ? el("p", { class: "hint" }, p.r.desc) : null, t), [
+        { text: "К эталону", run: () => goTo(p.r.addr - S.base) }, { text: "OK", primary: true, run: () => { } }]);
+  }
+  function refDialog(r) {
+    const res = M.readObject(r, data(), a => a - S.base, ref => S.ref.objects.find(x => x.addr === ref && x.kind === "axis") || null);
+    const rows = (r.kind === "map" || r.kind === "block") ? r.rows : 1;
+    const body = el("div", {}, el("p", {}, el("b", {}, r.name), " — ", r.desc || ""), el("p", { class: "mono" }, hexl(r.addr, addrW()) + "  " + M.describe(r)),
+      r.kind === "value" ? el("div", { class: "score mono" }, fmtVal(res.values[0])) :
+        el("div", { style: { overflow: "auto", maxHeight: "50vh" }, html: r.kind === "string" ? esc(res.text || "") : tableHtml(res.values, r.cols, rows, res.axisC, r.kind === "map" ? res.axisR : null, fmtVal) }));
+    dialog("Эталон: " + r.name, body, [
+      { text: "Взять в маппак", run: () => adoptRef([r]) },
+      { text: "OK", primary: true, run: () => { } }]);
+  }
+
+  // ------------------------------------------------------------- диалоги
+  let dlgClose = null;
+  function dialog(title, body, buttons) {
+    const veil = $("#veil");
+    veil.innerHTML = "";
+    const btns = el("div", { class: "btns" });
+    const box = el("div", { class: "dlg", role: "dialog" }, el("h3", {}, title), el("div", { class: "body" }, body), btns);
+    const close = () => { veil.classList.remove("on"); veil.innerHTML = ""; dlgClose = null; $("#view").focus(); };
+    for (const b of buttons.concat([{ text: buttons.length ? "Отмена" : "Закрыть", cancel: true }])) {
+      btns.append(el("button", { class: b.primary ? "primary" : "", onclick: () => {
+        if (b.cancel) { close(); return; }
+        const r = b.run();
+        // действие могло открыть следующий диалог -- его не трогаем
+        if (r !== false && dlgClose === close) close();
+      } }, b.text));
+    }
+    box.addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.preventDefault(); close(); }
+      else if (e.key === "Enter" && (e.ctrlKey || (e.target.tagName === "INPUT" && e.target.type !== "checkbox"))) {
+        const p = btns.querySelector(".primary");
+        if (p) { e.preventDefault(); p.click(); }
+      }
+      e.stopPropagation();
+    });
+    veil.append(box);
+    veil.classList.add("on");
+    dlgClose = close;
+    // фокус сразу, а не по таймеру: иначе первые набранные символы теряются
+    const first = box.querySelector("input,select,textarea,button.primary");
+    if (first) first.focus();
+    return close;
+  }
+
+  function gotoDialog() {
+    const dl = el("datalist", { id: "gotoList" });
+    const names = S.pack.objects.map(o => o.name).concat(refVisible() ? S.ref.objects.map(o => o.name) : []);
+    for (const n of names.slice(0, 5000)) dl.append(el("option", { value: n }));
+    const inp = el("input", { style: { width: "100%" }, class: "mono", list: "gotoList", placeholder: "адрес (C84B78, 0x…), +смещение в файле или имя объекта" });
+    dialog("Перейти — G", el("div", {}, inp, dl), [
+      { text: "Перейти", primary: true, run: () => {
+        const off = parseAddr(inp.value);
+        if (off === null || !inImg(off)) { toast("Не понял адрес или он вне образа"); return false; }
+        goTo(off);
+      } }]);
+    inp.focus();
+  }
+
+  function encodeText(s) {
+    const out = [];
+    for (const ch of s) { let b = M.CP1251.indexOf(ch); if (b < 0) b = ch.charCodeAt(0) & 0xFF; out.push(b); }
+    return out;
+  }
+  function parsePattern(mode, s) {
+    if (mode === "text") return encodeText(s);
+    const t = s.replace(/[\s,]+/g, "");
+    if (!t || t.length % 2) return null;
+    const out = [];
+    for (let i = 0; i < t.length; i += 2) {
+      const p = t.slice(i, i + 2);
+      if (p === "??") out.push(-1);
+      else if (/^[0-9a-f]{2}$/i.test(p)) out.push(parseInt(p, 16));
+      else return null;
+    }
+    return out;
+  }
+  function findAll(pat, limit) {
+    const d = data(), res = [];
+    const first = pat.findIndex(b => b >= 0);
+    outer: for (let i = 0; i + pat.length <= d.length; i++) {
+      if (first >= 0 && d[i + first] !== pat[first]) continue;
+      for (let k = 0; k < pat.length; k++) if (pat[k] >= 0 && d[i + k] !== pat[k]) continue outer;
+      res.push(i);
+      if (res.length >= limit) break;
+    }
+    return res;
+  }
+  function searchDialog() {
+    const last = S.lastSearch || { mode: "hex", text: "" };
+    const mode = el("select", {}, el("option", { value: "hex", selected: last.mode === "hex" }, "байты (hex, ?? — любой)"),
+      el("option", { value: "text", selected: last.mode === "text" }, "текст (cp1251)"));
+    const inp = el("input", { class: "mono", style: { width: "100%" }, value: last.text, placeholder: "e6 f8 ?? 4b   или   AEC 07" });
+    const list = el("div", { class: "list", style: { maxHeight: "40vh", overflow: "auto" } });
+    const run = all => {
+      const pat = parsePattern(mode.value, inp.value);
+      if (!pat || !pat.length) { toast("Пустой или неверный образец"); return false; }
+      S.lastSearch = { mode: mode.value, text: inp.value, pat };
+      if (!all) { searchNext(); return; }
+      const res = findAll(pat, 500);
+      list.innerHTML = "";
+      list.append(el("div", { class: "hint" }, "Найдено: " + res.length + (res.length >= 500 ? " (первые 500)" : "")));
+      for (const o of res) {
+        const u = mineAt(o) || refAt(o);
+        list.append(el("div", { class: "item", onclick: () => goTo(o) }, el("span", { class: "addr" }, fa(o)), el("span", { class: "nm" }, u ? u.item.name : "")));
+      }
+      return false;
+    };
+    dialog("Поиск — Ctrl+F", el("div", {}, el("div", { class: "row" }, mode), inp, list), [
+      { text: "Найти все", run: () => run(true) },
+      { text: "Найти далее (F3)", primary: true, run: () => run(false) }]);
+    inp.focus();
+  }
+  function searchNext() {
+    const ls = S.lastSearch;
+    if (!ls) { searchDialog(); return; }
+    const d = data(), pat = ls.pat;
+    for (let n = 1; n <= d.length; n++) {
+      const i = (S.cur + n) % d.length;
+      if (i + pat.length > d.length) continue;
+      let ok = true;
+      for (let k = 0; k < pat.length; k++) if (pat[k] >= 0 && d[i + k] !== pat[k]) { ok = false; break; }
+      if (ok) { goTo(i); S.sel = { a: i, b: i + pat.length - 1 }; renderHex(); renderInsp(); return; }
+    }
+    toast("Не найдено");
+  }
+
+  function helpDialog() {
+    const keys = [
+      ["стрелки, PgUp/PgDn", "курсор; с Shift — выделение (или тяните мышью)"],
+      ["Home / End", "начало / конец строки; с Ctrl — начало / конец файла"],
+      ["G, Ctrl+G", "перейти к адресу, +смещению или имени"],
+      ["] / [", "следующий / предыдущий объект (ваш или эталона)"],
+      ["Alt+← / Alt+→", "назад / вперёд по переходам"],
+      ["M", "новый объект у курсора или по выделению; на своём объекте — изменить"],
+      ["Enter, двойной щелчок", "открыть объект под курсором"],
+      ["Del", "удалить свой объект под курсором"],
+      ["- / +", "сетка у курсора: уже / шире"],
+      ["Ctrl+F, F3", "поиск байтов или текста; следующее"],
+      ["Ctrl+Z / Ctrl+Y", "отменить / вернуть"],
+      ["Ctrl+S / Ctrl+Shift+S", "сохранить маппак как A2L / DAMOS"],
+      ["Ctrl+O", "открыть прошивку"],
+    ];
+    const t = el("table", { class: "keys" }, ...keys.map(([k, d]) => el("tr", {}, el("td", {}, el("kbd", {}, k)), el("td", {}, d))));
+    dialog("Горячие клавиши", el("div", {}, t,
+      el("p", { class: "hint" }, "Цвета в hex: заливка — ваш маппак (данные, оси, счётчики), подчёркивание — эталон. Адрес — база + смещение; щелчок по заголовку столбца адресов переключает на смещение в файле.")), []);
+  }
+
+  // ------------------------------------------------------------ файлы
+  async function openFirmware(file) {
+    if (!file) return;
+    const buf = new Uint8Array(await file.arrayBuffer());
+    if (!buf.length) { toast("Пустой файл"); return; }
+    S.fw = { name: file.name, size: buf.length, data: buf, crc: crc32(buf) };
+    S.pack = new MK.Pack(buf.length);
+    S.cur = 0; S.sel = null; S.anchor = 0; S.top = 0; S.hist = []; S.fwd = []; S.undo = []; S.redo = []; S.lastCheck = null;
+    const saved = lsGet("ecu-hex:" + S.fw.crc);
+    if (saved) {
+      try {
+        const p = JSON.parse(saved);
+        S.base = p.base || 0;
+        S.pack = MK.Pack.fromJSON(p.pack, buf.length);
+        S.hideRef = !!p.hideRef;
+        if (inImg(p.cur)) { S.cur = p.cur; S.anchor = p.cur; S.top = Math.max(0, (p.cur >> 4) - 3); }
+        if (S.pack.objects.length) toast("Восстановлен маппак этой прошивки: " + S.pack.objects.length + " объектов");
+      } catch (e) { /* испорчено -- начинаем заново */ }
+    }
+    if (S.ref) relinkRef();
+    renderAll();
+    $("#view").focus();
+    if (S.ref && !saved) suggestBase(S.ref.raw, "эталона");
+  }
+
+  // Предложить базу, при которой объекты файла ложатся в образ
+  function suggestBase(objs, what, after) {
+    if (!S.fw || !objs.length) { if (after) after(); return; }
+    const sug = F.suggestBases(objs, data());
+    const cur = F.scoreBase(objs, data(), S.base);
+    const best = sug[0];
+    if (!best || best.base === S.base || best.score <= cur.score) { if (after) after(); return; }
+    const body = el("div", {},
+      el("p", {}, "При базе 0x" + hexl(S.base) + " в образ попадает " + cur.inside + " объектов " + what + " из " + objs.length + "."),
+      el("p", {}, "При базе ", el("b", { class: "mono" }, "0x" + hexl(best.base)), " — " + best.inside + (best.hdr ? ", и совпадает " + best.hdrOk + " заголовков карт из " + best.hdr : "") + "."),
+      el("p", { class: "hint" }, "База — адрес первого байта файла (Base Address в Ghidra). Если в Ghidra у вас другая база, оставьте её: адреса " + what + " будут сдвинуты."));
+    const btns = [{ text: "Сделать базу 0x" + hexl(best.base), primary: true, run: () => { setBase(best.base); if (after) setTimeout(after, 0); } }];
+    if (what === "эталона") btns.unshift({ text: "Оставить базу, сдвинуть эталон", run: () => { S.ref.shift = S.base - best.base; relinkRef(); renderAll(); } });
+    else btns.unshift({ text: "Оставить базу", run: () => { if (after) setTimeout(after, 0); } });
+    dialog("База образа", body, btns);
+  }
+
+  function setBase(b) {
+    S.base = b;
+    relinkRef();
+    S.lastCheck = null;
+    saveSoon(); renderAll();
+  }
+
+  async function openReference(file) {
+    if (!file) return;
+    let r;
+    try { r = F.loadReference(await readText(file), file.name); }
+    catch (e) { toast("Не удалось разобрать: " + e.message, 5000); return; }
+    S.ref = { name: file.name, format: r.format, raw: r.objects, objects: r.objects, shift: 0 };
+    S.lastCheck = null;
+    relinkRef();
+    toast(r.format + ": " + r.objects.length + " объектов", 3000);
+    if (!S.hideRef) S.side = "ref";
+    syncTabs();
+    renderAll();
+    suggestBase(r.objects, "эталона");
+  }
+
+  // Сдвиг эталона, уточнение размеров по заголовкам и индекс по смещениям
+  function relinkRef() {
+    if (!S.ref) return;
+    const sh = S.ref.shift || 0;
+    S.ref.objects = S.ref.raw.map(o => MK.shift(o, sh));
+    if (S.fw) {
+      F.refineWithImage(S.ref.objects, data(), a => a - S.base);
+      S.ref.pack = MK.Pack.fromJSON(S.ref.objects.map(o => MK.shift(o, -S.base)), size());
+    }
+  }
+
+  async function openPack(file) {
+    if (!file || !S.fw) return;
+    let r;
+    try { r = F.loadReference(await readText(file), file.name); }
+    catch (e) { toast("Не удалось разобрать: " + e.message, 5000); return; }
+    const load = mode => {
+      F.refineWithImage(r.objects, data(), a => a - S.base);
+      change(() => {
+        if (mode === "replace") S.pack.objects = [];
+        for (const o of r.objects) {
+          const c = MK.shift(o, -S.base);
+          delete c.source; delete c.typ;
+          if (nameTaken(c.name)) c.name += "_" + hexl(o.addr);
+          S.pack.add(c);
+        }
+      });
+      toast("Маппак: " + r.objects.length + " объектов из " + file.name);
+      S.side = "pack"; syncTabs(); renderSide();
+    };
+    const ask = () => {
+      if (!S.pack.objects.length) { load("replace"); return; }
+      dialog("Открыть маппак", el("p", {}, "В маппаке уже " + S.pack.objects.length + " объектов. Заменить их или добавить объекты из " + file.name + "?"), [
+        { text: "Добавить", run: () => load("merge") }, { text: "Заменить", primary: true, run: () => load("replace") }]);
+    };
+    suggestBase(r.objects, "маппака", ask);
+  }
+
+  function savePack(fmt) {
+    if (!S.fw) return toast("Нет прошивки");
+    if (!S.pack.objects.length) return toast("Маппак пуст — нечего сохранять");
+    const objs = MK.cpuObjects(S.pack, S.base).map(o => { delete o._orig; return o; });
+    const name = S.fw.name.replace(/\.[^.]+$/, "");
+    const opts = { project: name, comment: S.fw.name + " CRC32 " + S.fw.crc, base: S.base, size: size() };
+    let res;
+    if (fmt === "a2l") { res = F.writeA2l(objs, opts); download(name + ".a2l", res.text); }
+    else { res = F.writeDamos(objs, opts); download(name + ".dam", F.encodeCp1251(res.text), "application/octet-stream"); }
+    if (res.warnings.length) {
+      dialog("Сохранено с замечаниями", el("div", {}, el("p", {}, "Формат " + (fmt === "a2l" ? "A2L" : "DAMOS") + " выражает не всё:"),
+        el("ul", {}, ...res.warnings.slice(0, 100).map(w => el("li", {}, w)))), []);
+    } else toast("Сохранено: " + objs.length + " объектов");
+  }
+
+  let saveT = 0;
+  function saveSoon() {
+    clearTimeout(saveT);
+    saveT = setTimeout(() => {
+      if (!S.fw) return;
+      const ok = lsSet("ecu-hex:" + S.fw.crc, JSON.stringify({ base: S.base, pack: S.pack.toJSON(), hideRef: S.hideRef, cur: S.cur }));
+      if (!ok) toast("Автосохранение недоступно — сохраните маппак в файл");
+    }, 1000);
+  }
+
+  const ACTIONS = {
+    newObject: () => (S.fw ? mapDialog(null) : toast("Сначала откройте прошивку")),
+    saveA2l: () => savePack("a2l"),
+    saveDamos: () => savePack("dam"),
+    openPack: async () => { if (!S.fw) return toast("Сначала откройте прошивку"); openPack(await pickFile(".a2l,.A2L,.dam,.DAM")); },
+    clearPack: () => {
+      if (!S.fw || !S.pack.objects.length) return;
+      if (!confirm("Удалить все " + S.pack.objects.length + " объектов маппака? (можно отменить Ctrl+Z)")) return;
+      change(() => { S.pack.objects = []; });
+    },
+  };
+
+  // ------------------------------------------------------------ статус
+  function renderStatus() {
+    const st = $("#status");
+    if (!S.fw) { st.innerHTML = "<span>Прошивка не открыта</span>"; return; }
+    let sel = "";
+    if (S.sel) { const [a, b] = selRange(); sel = " · выделено " + (b - a) + " байт"; }
+    st.innerHTML =
+      "<span><b>" + esc(S.fw.name) + "</b> " + S.fw.size.toLocaleString("ru") + " байт, CRC32 " + S.fw.crc + "</span>" +
+      "<span>курсор <b>" + fa(S.cur) + "</b> (+" + hexl(S.cur) + ")" + sel + "</span>" +
+      "<span>маппак: " + S.pack.objects.length + "</span>" +
+      "<span>" + (S.ref ? "эталон: " + esc(S.ref.name) + (S.hideRef ? " (скрыт)" : "") : "эталон не загружен") + "</span>";
+  }
+
+  function renderAll() {
+    $("#baseIn").value = "0x" + hexl(S.base);
+    renderHex(); renderInsp(); renderStatus(); renderBottom(); renderSide();
+  }
+  function syncTabs() { for (const x of $("#sidetabs").children) x.classList.toggle("on", x.dataset.tab === S.side); }
+
+  // ------------------------------------------------------------ клавиатура
+  document.addEventListener("keydown", e => {
+    if ($("#veil").classList.contains("on")) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    const k = e.key, kl = k.length === 1 ? k.toLowerCase() : k;
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (k === "F1") { e.preventDefault(); helpDialog(); return; }
+    if (ctrl && kl === "o") { e.preventDefault(); pickFile().then(openFirmware); return; }
+    if (!S.fw) return;
+    const n = visibleRows();
+    let handled = true;
+    if (e.altKey && k === "ArrowLeft") back();
+    else if (e.altKey && k === "ArrowRight") forward();
+    else if (ctrl && kl === "s") savePack(e.shiftKey ? "dam" : "a2l");
+    else if (ctrl && kl === "z" && !e.shiftKey) undo();
+    else if (ctrl && (kl === "y" || (kl === "z" && e.shiftKey))) redo();
+    else if (ctrl && kl === "f") searchDialog();
+    else if (ctrl && kl === "g") gotoDialog();
+    else if (ctrl && k === "Home") setCur(0, e.shiftKey);
+    else if (ctrl && k === "End") setCur(size() - 1, e.shiftKey);
+    else if (ctrl || e.altKey) handled = false;
+    else if (k === "ArrowRight") setCur(S.cur + 1, e.shiftKey);
+    else if (k === "ArrowLeft") setCur(S.cur - 1, e.shiftKey);
+    else if (k === "ArrowDown") setCur(S.cur + 16, e.shiftKey);
+    else if (k === "ArrowUp") setCur(S.cur - 16, e.shiftKey);
+    else if (k === "PageDown") { S.top += n - 1; setCur(S.cur + 16 * (n - 1), e.shiftKey); }
+    else if (k === "PageUp") { S.top = Math.max(0, S.top - n + 1); setCur(S.cur - 16 * (n - 1), e.shiftKey); }
+    else if (k === "Home") setCur(S.cur & ~15, e.shiftKey);
+    else if (k === "End") setCur(S.cur | 15, e.shiftKey);
+    else if (k === "Escape") { S.sel = null; renderHex(); renderInsp(); renderStatus(); }
+    else if (k === "F3") searchNext();
+    else if (k === "Enter") openUnderCursor();
+    else if (k === "Delete") { const u = mineAt(S.cur); if (u) change(() => S.pack.remove(u.item)); }
+    else if (kl === "g") gotoDialog();
+    else if (kl === "m") { const u = mineAt(S.cur); mapDialog(u && !S.sel ? u.item : null); }
+    else if (k === "]") jumpObject(1);
+    else if (k === "[") jumpObject(-1);
+    else if (k === "-" || k === "+" || k === "=") { S.probe.w = Math.max(1, Math.min(64, S.probe.w + (k === "-" ? -1 : 1))); renderBottom(); }
+    else if (k === "?") helpDialog();
+    else handled = false;
+    if (handled) e.preventDefault();
+  });
+
+  function openUnderCursor() {
+    const mu = mineAt(S.cur);
+    if (mu) return mapDialog(mu.item);
+    const ru = refAt(S.cur);
+    if (ru) return refDialog(refOrig(ru.item));
+    mapDialog(null);
+  }
+
+  // ------------------------------------------------------------ мышь
+  function wireView() {
+    const view = $("#view");
+    let dragging = false;
+    view.addEventListener("mousedown", e => {
+      if (!S.fw) return;
+      view.focus();
+      const t = e.target.closest("[data-o]");
+      if (!t) return;
+      e.preventDefault();
+      const off = +t.dataset.o;
+      if (e.shiftKey) { setCur(off, true); return; }
+      setCur(off, false);
+      dragging = true;
+    });
+    view.addEventListener("mousemove", e => {
+      if (!dragging || !(e.buttons & 1)) return;
+      const t = e.target.closest("[data-o]");
+      if (!t) return;
+      const off = +t.dataset.o;
+      if (off !== S.cur) setCur(off, true);
+    });
+    window.addEventListener("mouseup", () => { dragging = false; });
+    view.addEventListener("dblclick", e => { if (e.target.closest("[data-o]")) openUnderCursor(); });
+    view.addEventListener("wheel", e => {
+      if (!S.fw) return;
+      e.preventDefault();
+      S.top = Math.max(0, Math.min(totalRows() - 1, S.top + Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40)) * 3));
+      renderHex();
+    }, { passive: false });
+    $("#hexhead").addEventListener("click", e => { if (e.target.closest(".a")) { S.showOff = !S.showOff; renderHex(); } });
+    // полоса прокрутки
+    const track = $("#vscroll");
+    const jump = e => {
+      if (!S.fw) return;
+      const r = track.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
+      S.top = Math.floor(frac * Math.max(0, totalRows() - visibleRows()));
+      renderHex();
+    };
+    let tdrag = false;
+    track.addEventListener("mousedown", e => { tdrag = true; jump(e); e.preventDefault(); });
+    window.addEventListener("mousemove", e => { if (tdrag) jump(e); });
+    window.addEventListener("mouseup", () => (tdrag = false));
+    window.addEventListener("resize", () => renderHex());
+    // высота нижней панели
+    let sdrag = false;
+    $("#split").addEventListener("mousedown", e => { sdrag = true; e.preventDefault(); });
+    window.addEventListener("mousemove", e => {
+      if (!sdrag) return;
+      const c = $("#center").getBoundingClientRect();
+      $("#bottom").style.height = Math.max(60, Math.min(c.height - 120, c.bottom - e.clientY)) + "px";
+      renderHex();
+    });
+    window.addEventListener("mouseup", () => (sdrag = false));
+  }
+
+  function wireChrome() {
+    $("#bOpenFw").onclick = async () => openFirmware(await pickFile());
+    $("#bOpenRef").onclick = async () => openReference(await pickFile(".dam,.DAM,.a2l,.A2L"));
+    $("#bHelp").onclick = helpDialog;
+    $("#baseIn").addEventListener("change", e => {
+      const v = parseInt(e.target.value.trim().replace(/^0x/i, ""), 16);
+      if (isNaN(v) || v < 0) { toast("База — шестнадцатеричное число"); e.target.value = "0x" + hexl(S.base); return; }
+      if (S.fw) setBase(v); else S.base = v;
+    });
+    $("#baseIn").addEventListener("keydown", e => { if (e.key === "Enter") { e.target.blur(); $("#view").focus(); } });
+    $("#bTheme").onclick = () => {
+      const r = document.documentElement;
+      const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+      r.dataset.theme = dark ? "light" : "dark";
+      lsSet("ecu-hex:theme", r.dataset.theme);
+      renderAll();
+    };
+    const th = lsGet("ecu-hex:theme");
+    if (th) document.documentElement.dataset.theme = th;
+    const menu = $("#mPack");
+    menu.firstElementChild.onclick = e => { e.stopPropagation(); menu.classList.toggle("open"); };
+    document.addEventListener("click", () => menu.classList.remove("open"));
+    menu.querySelectorAll("[data-act]").forEach(b => (b.onclick = () => { menu.classList.remove("open"); ACTIONS[b.dataset.act](); }));
+    $("#sidetabs").addEventListener("click", e => {
+      const b = e.target.closest("[data-tab]");
+      if (!b) return;
+      S.side = b.dataset.tab; syncTabs(); renderSide();
+    });
+    // перетаскивание: .dam/.a2l -- эталон (с Shift -- в свой маппак), остальное -- прошивка
+    const drop = $("#drop");
+    window.addEventListener("dragover", e => { e.preventDefault(); drop.style.display = "block"; });
+    window.addEventListener("dragleave", e => { if (!e.relatedTarget) drop.style.display = "none"; });
+    window.addEventListener("drop", async e => {
+      e.preventDefault(); drop.style.display = "none";
+      const files = Array.from(e.dataTransfer.files);
+      // прошивку -- первой, чтобы эталону было к чему привязаться
+      files.sort((a, b) => /\.(dam|a2l)$/i.test(a.name) - /\.(dam|a2l)$/i.test(b.name));
+      for (const f of files) {
+        if (/\.(dam|a2l)$/i.test(f.name)) { if (e.shiftKey && S.fw) await openPack(f); else await openReference(f); }
+        else await openFirmware(f);
+      }
+    });
+  }
+
+  wireChrome();
+  wireView();
+  renderAll();
+
+  // для отладки и тестов в браузере
+  window.ETApp = { S, openFirmware, openReference, openPack, savePack, goTo, setBase, runCheck, change, ACTIONS, renderAll };
+})();

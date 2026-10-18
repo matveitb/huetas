@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ЭБУ hex-тренажёр</title>
+<style>
+:root {
+  --bg: #fbfbf8; --panel: #f1f0ea; --line: #d9d7cd; --fg: #1d1d1b; --muted: #6d6b63;
+  --accent: #2f5fb3; --accent-fg: #fff;
+  --obj: #b35a00; --axis: #9a6d00; --cnt: #7a6a4a; --str: #7b3fb0; --ref: #00838f; --zero: #b7b4a8;
+  --sel-bg: #b9d2ff;
+  --hex-obj: #fde0c2; --hex-axis: #fbefc0; --hex-cnt: #ece2cc; --hex-str: #ece0f7;
+  --ok: #1d7a3a; --warn: #b26b00; --bad: #b3261e;
+  --mono: ui-monospace, "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+  --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1b1c1f; --panel: #232428; --line: #383a40; --fg: #e3e3df; --muted: #9a9a94;
+    --accent: #6d9cf0; --accent-fg: #0d1526;
+    --obj: #ffad5c; --axis: #e6c15a; --cnt: #c7b48c; --str: #c69cf0; --ref: #5cc9d3; --zero: #5d5d58;
+    --sel-bg: #2b4a80;
+    --hex-obj: #4a321a; --hex-axis: #423818; --hex-cnt: #36302a; --hex-str: #33264a;
+    --ok: #63c27f; --warn: #e3a64a; --bad: #ef7a72;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1b1c1f; --panel: #232428; --line: #383a40; --fg: #e3e3df; --muted: #9a9a94;
+  --accent: #6d9cf0; --accent-fg: #0d1526;
+  --obj: #ffad5c; --axis: #e6c15a; --cnt: #c7b48c; --str: #c69cf0; --ref: #5cc9d3; --zero: #5d5d58;
+  --sel-bg: #2b4a80;
+  --hex-obj: #4a321a; --hex-axis: #423818; --hex-cnt: #36302a; --hex-str: #33264a;
+  --ok: #63c27f; --warn: #e3a64a; --bad: #ef7a72;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: flex; flex-direction: column; overflow: hidden; }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 3px 9px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+input, select, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+
+/* шапка */
+#top { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+#top .brand { font-weight: 600; margin-right: 8px; }
+#top .sp { flex: 1; }
+.menu { position: relative; }
+.menu > .items { display: none; position: absolute; top: 100%; left: 0; z-index: 50; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px; min-width: 300px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+.menu.open > .items { display: block; }
+.menu .items button { display: flex; justify-content: space-between; gap: 12px; width: 100%; text-align: left; border: 0; background: none; padding: 5px 8px; }
+.menu .items button:hover { background: var(--sel-bg); }
+.menu .items hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+
+/* раскладка */
+#main { flex: 1; display: flex; min-height: 0; }
+#side { width: 320px; min-width: 240px; border-right: 1px solid var(--line); display: flex; flex-direction: column; background: var(--panel); }
+#center { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.tabs { display: flex; gap: 2px; padding: 4px 6px 0; border-bottom: 1px solid var(--line); }
+.tabs button { border-radius: 4px 4px 0 0; border-bottom: 0; background: none; }
+.tabs button.on { background: var(--bg); border-color: var(--line); font-weight: 600; }
+#sidebody { flex: 1; overflow: auto; padding: 8px; background: var(--bg); }
+#viewwrap { flex: 1; display: flex; min-height: 0; }
+#hexcol { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#view { flex: 1; overflow: hidden; font: 13px/18px var(--mono); white-space: pre; outline: none; cursor: default; user-select: none; }
+#vscroll { width: 14px; border-left: 1px solid var(--line); position: relative; background: var(--panel); cursor: pointer; }
+#vthumb { position: absolute; left: 2px; right: 2px; background: var(--muted); opacity: .45; border-radius: 4px; min-height: 18px; }
+#split { height: 5px; cursor: row-resize; background: var(--line); }
+#bottom { height: 270px; display: flex; flex-direction: column; background: var(--bg); }
+#bottombar { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+#bottombody { flex: 1; overflow: auto; padding: 6px 8px; }
+#status { display: flex; gap: 14px; padding: 3px 10px; border-top: 1px solid var(--line); background: var(--panel); font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+#status b { color: var(--fg); font-weight: 600; }
+
+/* hex */
+#hexhead { font: 13px/18px var(--mono); white-space: pre; padding-left: 6px; color: var(--muted); border-bottom: 1px solid var(--line); background: var(--panel); user-select: none; }
+.hx, #hexhead { padding-left: 6px; }
+.hx { height: 18px; }
+.hx .a, #hexhead .a { color: var(--muted); display: inline-block; width: 10ch; }
+#hexhead .a { cursor: pointer; }
+.hx span.y, #hexhead span.y { display: inline-block; width: 3ch; text-align: center; }
+.hx span.y.g8, #hexhead span.y.g8 { margin-right: 1ch; }
+.hx span.y.z { color: var(--zero); }
+.hx .t { margin-left: 2ch; color: var(--muted); }
+.hx .t span.on { color: var(--fg); }
+.k-obj { background: var(--hex-obj); } .k-axis { background: var(--hex-axis); }
+.k-cnt { background: var(--hex-cnt); } .k-str { background: var(--hex-str); }
+.r-data { box-shadow: inset 0 -2px 0 var(--ref); } .r-axis { box-shadow: inset 0 -2px 0 var(--axis); }
+.r-cnt { box-shadow: inset 0 -2px 0 var(--cnt); } .r-str { box-shadow: inset 0 -2px 0 var(--str); }
+.hx .cur { outline: 2px solid var(--accent); outline-offset: -2px; }
+.hx .sel { background: var(--sel-bg) !important; }
+
+/* инспектор */
+#insp { width: 260px; border-left: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 6px 8px; font-size: 12px; }
+#insp table { border-collapse: collapse; width: 100%; font: 12px/1.55 var(--mono); }
+#insp td { padding: 0 4px; white-space: nowrap; }
+#insp td:first-child { color: var(--muted); font-family: var(--ui); }
+#insp h4 { margin: 8px 0 3px; font-size: 12px; }
+.objbox { border-left: 3px solid var(--obj); padding: 3px 7px; margin: 4px 0; background: var(--bg); border-radius: 0 4px 4px 0; }
+.objbox.ref { border-left-color: var(--ref); }
+.objbox b { font-family: var(--mono); }
+.legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 10px; margin-right: 3px; vertical-align: -1px; border-radius: 2px; }
+
+/* боковая панель */
+.list { display: flex; flex-direction: column; gap: 1px; }
+.item { padding: 3px 6px; border-radius: 4px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.item:hover { background: var(--sel-bg); }
+.item.on { background: var(--sel-bg); }
+.item .addr { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+.item .nm { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .kd { font-size: 11px; color: var(--muted); margin-left: auto; white-space: nowrap; }
+.sec { margin: 10px 0 4px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+.badge { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 11px; border: 1px solid currentColor; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.score { font-size: 28px; font-weight: 700; }
+table.chk { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.chk td { padding: 3px 5px; border-top: 1px solid var(--line); vertical-align: top; }
+table.chk td.mono { font-family: var(--mono); }
+.hint { font-size: 12px; color: var(--muted); }
+.empty { color: var(--muted); padding: 10px 4px; }
+
+/* таблица карты */
+table.map { border-collapse: collapse; font: 12px/1.3 var(--mono); }
+table.map td, table.map th { padding: 1px 5px; text-align: right; border: 1px solid var(--line); white-space: nowrap; }
+table.map th { background: var(--panel); color: var(--axis); font-weight: 600; }
+table.map th.corner { color: var(--muted); font-weight: 400; }
+canvas.plot { display: block; max-width: 100%; }
+
+/* диалоги */
+#veil { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; z-index: 100; align-items: flex-start; justify-content: center; padding-top: 5vh; }
+#veil.on { display: flex; }
+.dlg { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.3); min-width: 380px; max-width: min(1100px, 96vw); max-height: 90vh; display: flex; flex-direction: column; }
+.dlg h3 { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.dlg .body { padding: 10px 14px; overflow: auto; }
+.dlg .btns { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.form { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; align-items: center; }
+.form > label { color: var(--muted); }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; padding: 6px 10px; }
+legend { color: var(--muted); padding: 0 4px; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; background: var(--panel); }
+table.keys td { padding: 3px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+#toast { position: fixed; bottom: 34px; left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 6px 14px; border-radius: 6px; display: none; z-index: 200; max-width: 80vw; }
+#drop { position: fixed; inset: 0; border: 4px dashed var(--accent); display: none; z-index: 150; pointer-events: none; }
+#welcome { padding: 30px; max-width: 760px; font: 14px/1.6 var(--ui); white-space: normal; user-select: text; }
+#welcome h2 { margin-top: 0; }
+#welcome li { margin: 4px 0; }
+
+@media (max-width: 760px) {
+  #main { flex-direction: column; }
+  #side { width: auto; height: 34vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  #insp { display: none; }
+  #bottom { height: 200px; }
+  .dlg { min-width: 0; width: 96vw; }
+  .form { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div id="top">
+  <span class="brand">ЭБУ hex-тренажёр</span>
+  <button id="bOpenFw" title="Открыть файл прошивки (.bin) — можно перетащить в окно. Ctrl+O">Прошивка…</button>
+  <button id="bOpenRef" title="Эталон: DAMOS (.dam) или A2L. Его карты подчёркнуты в hex, с ним идёт сверка">Эталон DAMOS / A2L…</button>
+  <div class="menu" id="mPack"><button>Мой маппак ▾</button>
+    <div class="items">
+      <button data-act="newObject">Новый объект у курсора… <span class="muted">M</span></button>
+      <hr>
+      <button data-act="saveA2l">Сохранить как A2L… <span class="muted">Ctrl+S</span></button>
+      <button data-act="saveDamos">Сохранить как DAMOS (.dam)… <span class="muted">Ctrl+Shift+S</span></button>
+      <button data-act="openPack">Открыть маппак (.a2l / .dam)…</button>
+      <hr>
+      <button data-act="clearPack">Очистить маппак…</button>
+    </div>
+  </div>
+  <label class="muted" title="Адрес первого байта файла — как Base Address при загрузке в Ghidra и как адреса в DAMOS/A2L">база <input id="baseIn" class="mono" style="width:100px" value="0x0"></label>
+  <span class="sp"></span>
+  <button id="bTheme" title="Светлая/тёмная тема">Тема</button>
+  <button id="bHelp" title="Горячие клавиши (F1)">Клавиши</button>
+</div>
+<div id="main">
+  <div id="side">
+    <div class="tabs" id="sidetabs">
+      <button data-tab="pack" class="on">Мой маппак</button>
+      <button data-tab="ref">Эталон</button>
+      <button data-tab="check">Сверка</button>
+    </div>
+    <div id="sidebody"></div>
+  </div>
+  <div id="center">
+    <div id="viewwrap">
+      <div id="hexcol">
+        <div id="hexhead"></div>
+        <div id="view" tabindex="0"></div>
+      </div>
+      <div id="vscroll"><div id="vthumb"></div></div>
+      <div id="insp"></div>
+    </div>
+    <div id="split" title="Потяните, чтобы изменить высоту"></div>
+    <div id="bottom">
+      <div id="bottombar"></div>
+      <div id="bottombody"></div>
+    </div>
+  </div>
+</div>
+<div id="status"></div>
+<div id="veil"></div>
+<div id="toast"></div>
+<div id="drop"></div>
+<input type="file" id="fileIn" hidden>
+
+<script src="model.js"></script>
+<script src="formats.js"></script>
+<script src="markup.js"></script>
+<script src="compare.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
