@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ЭБУ hex-тренажёр</title>
+<meta name="claude:viewport-fit-sides" content="cover">
 <style>
 :root {
   --bg: #fbfbf8; --panel: #f1f0ea; --line: #d9d7cd; --fg: #1d1d1b; --muted: #6d6b63;
@@ -23,6 +24,7 @@
     --sel-bg: #2b4a80;
     --hex-obj: #4a321a; --hex-axis: #423818; --hex-cnt: #36302a; --hex-str: #33264a;
     --ok: #63c27f; --warn: #e3a64a; --bad: #ef7a72;
+    color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
@@ -32,10 +34,12 @@
   --sel-bg: #2b4a80;
   --hex-obj: #4a321a; --hex-axis: #423818; --hex-cnt: #36302a; --hex-str: #33264a;
   --ok: #63c27f; --warn: #e3a64a; --bad: #ef7a72;
+  color-scheme: dark;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
-body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: flex; flex-direction: column; overflow: hidden; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: flex; flex-direction: column; overflow: hidden;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
 button, select, input, textarea { font: inherit; color: inherit; }
 button { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 3px 9px; cursor: pointer; }
 button:hover { border-color: var(--accent); }

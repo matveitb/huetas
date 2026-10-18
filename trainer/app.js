@@ -59,6 +59,47 @@
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
+  // Архив .zip без сжатия: в опубликованной странице сохранять можно только
+  // файлы из белого списка расширений, .a2l и .dam в него не входят
+  function makeZip(name, bytes) {
+    const nm = new TextEncoder().encode(name);
+    const crc = parseInt(crc32(bytes), 16);
+    const local = new DataView(new ArrayBuffer(30)), cen = new DataView(new ArrayBuffer(46)), end = new DataView(new ArrayBuffer(22));
+    const d = new Date(), time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    const head = (v, sig, off) => {
+      v.setUint32(0, sig, true);
+      let o = 4;
+      if (sig === 0x02014b50) { v.setUint16(o, 20, true); o += 2; }
+      v.setUint16(o, 20, true); v.setUint16(o + 2, 0x0800, true); v.setUint16(o + 4, 0, true);
+      v.setUint16(o + 6, time, true); v.setUint16(o + 8, date, true);
+      v.setUint32(o + 10, crc, true); v.setUint32(o + 14, bytes.length, true); v.setUint32(o + 18, bytes.length, true);
+      v.setUint16(o + 22, nm.length, true);
+      if (sig === 0x02014b50) v.setUint32(42, off, true);
+    };
+    head(local, 0x04034b50, 0);
+    head(cen, 0x02014b50, 0);
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, 1, true); end.setUint16(10, 1, true);
+    end.setUint32(12, 46 + nm.length, true); end.setUint32(16, 30 + nm.length + bytes.length, true);
+    return new Blob([local, nm, bytes, cen, nm, end], { type: "application/zip" });
+  }
+
+  // Сохранить файл: в опубликованной странице -- через просмотрщик, в zip;
+  // при локальном запуске -- обычным скачиванием
+  async function saveFile(name, bytes) {
+    const cl = window.claude && typeof window.claude.use === "function" ? window.claude : null;
+    const dl = cl ? await cl.use("downloads") : null;
+    if (!dl) { download(name, bytes, "application/octet-stream"); return true; }
+    try {
+      await dl.save({ filename: name + ".zip", data: makeZip(name, bytes) });
+      toast("Сохранено: " + name + " (внутри " + name + ".zip)", 4000);
+      return true;
+    } catch (e) {
+      toast(e && e.code === "declined" ? "Сохранение отменено" : "Не удалось сохранить: " + ((e && (e.message || e.code)) || e), 5000);
+      return false;
+    }
+  }
+
   function pickFile(accept) {
     return new Promise(res => {
       const inp = $("#fileIn");
@@ -1202,19 +1243,19 @@
     suggestBase(r.objects, "маппака", ask);
   }
 
-  function savePack(fmt) {
+  async function savePack(fmt) {
     if (!S.fw) return toast("Нет прошивки");
     if (!S.pack.objects.length) return toast("Маппак пуст — нечего сохранять");
     const objs = MK.cpuObjects(S.pack, S.base).map(o => { delete o._orig; return o; });
     const name = S.fw.name.replace(/\.[^.]+$/, "");
     const opts = { project: name, comment: S.fw.name + " CRC32 " + S.fw.crc, base: S.base, size: size() };
-    let res;
-    if (fmt === "a2l") { res = F.writeA2l(objs, opts); download(name + ".a2l", res.text); }
-    else { res = F.writeDamos(objs, opts); download(name + ".dam", F.encodeCp1251(res.text), "application/octet-stream"); }
+    const res = fmt === "a2l" ? F.writeA2l(objs, opts) : F.writeDamos(objs, opts);
+    const bytes = fmt === "a2l" ? new TextEncoder().encode(res.text) : F.encodeCp1251(res.text);
+    if (!(await saveFile(name + (fmt === "a2l" ? ".a2l" : ".dam"), bytes))) return;
     if (res.warnings.length) {
       dialog("Сохранено с замечаниями", el("div", {}, el("p", {}, "Формат " + (fmt === "a2l" ? "A2L" : "DAMOS") + " выражает не всё:"),
         el("ul", {}, ...res.warnings.slice(0, 100).map(w => el("li", {}, w)))), []);
-    } else toast("Сохранено: " + objs.length + " объектов");
+    } else if (!window.claude) toast("Сохранено: " + objs.length + " объектов");
   }
 
   let saveT = 0;
@@ -1234,8 +1275,8 @@
     openPack: async () => { if (!S.fw) return toast("Сначала откройте прошивку"); openPack(await pickFile(".a2l,.A2L,.dam,.DAM")); },
     clearPack: () => {
       if (!S.fw || !S.pack.objects.length) return;
-      if (!confirm("Удалить все " + S.pack.objects.length + " объектов маппака? (можно отменить Ctrl+Z)")) return;
-      change(() => { S.pack.objects = []; });
+      dialog("Очистить маппак", el("p", {}, "Удалить все " + S.pack.objects.length + " объектов маппака? Отменить можно клавишами Ctrl+Z."), [
+        { text: "Удалить всё", primary: true, run: () => change(() => { S.pack.objects = []; }) }]);
     },
   };
 
@@ -1425,5 +1466,5 @@
   renderAll();
 
   // для отладки и тестов в браузере
-  window.ETApp = { S, openFirmware, openReference, openPack, savePack, goTo, setBase, runCheck, change, ACTIONS, renderAll };
+  window.ETApp = { S, makeZip, openFirmware, openReference, openPack, savePack, goTo, setBase, runCheck, change, ACTIONS, renderAll };
 })();
